@@ -1,8 +1,8 @@
-import { useEffect } from "react";
+import { useEffect, useState } from "react";
 import { data, isRouteErrorResponse, Link, useFetcher } from "react-router";
-import { eq } from "drizzle-orm";
 import { toast } from "sonner";
 import { z } from "zod";
+import { eq } from "drizzle-orm";
 import type { Route } from "./+types/admin.refunds";
 import { getCurrentUserId } from "~/lib/session";
 import { parseFormData } from "~/lib/validation";
@@ -10,6 +10,10 @@ import { UserRole, users } from "~/db/schema";
 import { db } from "~/db";
 import {
   approveRefundRequest,
+  buildApprovedRefundRequestEmail,
+  buildDeclinedRefundRequestEmail,
+  declineRefundRequest,
+  DeclineNoteRequiredError,
   listRefundRequestsForStaff,
   RefundRequestAlreadyDecidedError,
   RefundRequestNotFoundError,
@@ -28,7 +32,24 @@ import {
   AlertDialogTitle,
   AlertDialogTrigger,
 } from "~/components/ui/alert-dialog";
+import { Label } from "~/components/ui/label";
+import { Textarea } from "~/components/ui/textarea";
 import { AlertTriangle, ReceiptText } from "lucide-react";
+
+const refundDecisionActionSchema = z.discriminatedUnion("intent", [
+  z.object({
+    intent: z.literal("approve"),
+    refundRequestId: z.coerce.number().int(),
+  }),
+  z.object({
+    intent: z.literal("decline"),
+    refundRequestId: z.coerce.number().int(),
+    declineNote: z
+      .string()
+      .trim()
+      .min(1, "Write a Decline Note so the learner knows why."),
+  }),
+]);
 
 export function meta() {
   return [
@@ -37,14 +58,7 @@ export function meta() {
   ];
 }
 
-const refundDecisionSchema = z.discriminatedUnion("intent", [
-  z.object({
-    intent: z.literal("approve"),
-    refundRequestId: z.coerce.number().int(),
-  }),
-]);
-
-async function requireStaff(request: Request) {
+export async function loader({ request }: Route.LoaderArgs) {
   const currentUserId = await getCurrentUserId(request);
 
   if (!currentUserId) {
@@ -63,47 +77,35 @@ async function requireStaff(request: Request) {
     throw data("Only Staff can see Refund Requests.", { status: 403 });
   }
 
-  return currentUser;
-}
-
-export async function loader({ request }: Route.LoaderArgs) {
-  await requireStaff(request);
-
   const { open } = listRefundRequestsForStaff(db);
 
   return { open };
 }
 
-/**
- * The learner's approved email. There is no mail transport wired up yet, so
- * the built message goes to the server log.
- */
-function buildRefundApprovedEmail(approved: {
-  learner: { name: string; email: string };
-  courseTitle: string;
-  amountRefunded: number;
-}) {
-  return {
-    to: approved.learner.email,
-    subject: `Refund approved — ${approved.courseTitle}`,
-    body: [
-      `Hi ${approved.learner.name},`,
-      "",
-      `We've approved your Refund Request for "${approved.courseTitle}".`,
-      `Your Refund of ${formatPrice(approved.amountRefunded)}, the full amount you paid, is on its way.`,
-      "",
-      "You no longer have access to the course. Your progress is kept, so if you buy it again you'll pick up where you left off.",
-      "",
-      "— The Cadence team",
-    ].join("\n"),
-  };
-}
-
 export async function action({ request }: Route.ActionArgs) {
-  const staff = await requireStaff(request);
+  const currentUserId = await getCurrentUserId(request);
+
+  if (!currentUserId) {
+    throw data(
+      "Select a user from the DevUI panel to decide Refund Requests.",
+      {
+        status: 401,
+      }
+    );
+  }
+
+  const currentUser = db
+    .select()
+    .from(users)
+    .where(eq(users.id, currentUserId))
+    .get();
+
+  if (!currentUser || currentUser.role !== UserRole.Admin) {
+    throw data("Only Staff can decide Refund Requests.", { status: 403 });
+  }
 
   const formData = await request.formData();
-  const parsed = parseFormData(formData, refundDecisionSchema);
+  const parsed = parseFormData(formData, refundDecisionActionSchema);
 
   if (!parsed.success) {
     return data(
@@ -114,19 +116,19 @@ export async function action({ request }: Route.ActionArgs) {
 
   if (parsed.data.intent === "approve") {
     try {
-      const approved = approveRefundRequest(db, {
+      const decision = approveRefundRequest(db, {
         refundRequestId: parsed.data.refundRequestId,
-        staffUserId: staff.id,
+        staffUserId: currentUser.id,
       });
 
-      const email = buildRefundApprovedEmail(approved);
+      const email = buildApprovedRefundRequestEmail(decision);
       console.log(
         `[email] to=${email.to} subject=${email.subject}\n${email.body}`
       );
 
       return {
         success: true,
-        message: `Approved the ${formatPrice(approved.amountRefunded)} refund to ${approved.learner.name}.`,
+        message: `Approved the ${formatPrice(decision.amountRefunded)} refund to ${decision.learner.name}.`,
       };
     } catch (e) {
       if (e instanceof RefundRequestAlreadyDecidedError) {
@@ -139,7 +141,70 @@ export async function action({ request }: Route.ActionArgs) {
     }
   }
 
+  if (parsed.data.intent === "decline") {
+    try {
+      const decision = declineRefundRequest(db, {
+        refundRequestId: parsed.data.refundRequestId,
+        staffUserId: currentUser.id,
+        declineNote: parsed.data.declineNote,
+      });
+
+      const email = buildDeclinedRefundRequestEmail(decision);
+      console.log(
+        `[email] to=${email.to} subject=${email.subject}\n${email.body}`
+      );
+
+      return { success: true, message: "Refund Request declined." };
+    } catch (e) {
+      if (e instanceof RefundRequestAlreadyDecidedError) {
+        return data({ error: e.message }, { status: 409 });
+      }
+      if (e instanceof DeclineNoteRequiredError) {
+        return data({ error: e.message }, { status: 400 });
+      }
+      throw e;
+    }
+  }
+
   throw data("Invalid action.", { status: 400 });
+}
+
+function DeclineRefundRequestForm({ requestId }: { requestId: number }) {
+  const [declineNote, setDeclineNote] = useState("");
+  const fetcher = useFetcher<typeof action>();
+
+  useEffect(() => {
+    if (fetcher.state !== "idle" || !fetcher.data) return;
+    if ("error" in fetcher.data) toast.error(fetcher.data.error);
+    else toast.success(fetcher.data.message);
+  }, [fetcher.state, fetcher.data]);
+
+  const noteId = `decline-note-${requestId}`;
+
+  return (
+    <fetcher.Form method="post" className="space-y-2 border-t pt-4">
+      <input type="hidden" name="intent" value="decline" />
+      <input type="hidden" name="refundRequestId" value={requestId} />
+      <Label htmlFor={noteId}>Decline Note</Label>
+      <Textarea
+        id={noteId}
+        name="declineNote"
+        value={declineNote}
+        onChange={(e) => setDeclineNote(e.target.value)}
+        placeholder="Tell the learner why their Refund Request is declined."
+        required
+      />
+      <div className="flex justify-end">
+        <Button
+          type="submit"
+          variant="outline"
+          disabled={!declineNote.trim() || fetcher.state !== "idle"}
+        >
+          Decline
+        </Button>
+      </div>
+    </fetcher.Form>
+  );
 }
 
 function formatDate(iso: string) {
@@ -248,9 +313,11 @@ function OpenRefundRequestCard({ request }: { request: OpenRefundRequest }) {
           <p className="whitespace-pre-wrap">{request.reason}</p>
         </div>
 
-        <div className="flex justify-end gap-2">
+        <div className="flex justify-end">
           <ApproveRefundRequestButton request={request} />
         </div>
+
+        <DeclineRefundRequestForm requestId={request.id} />
       </CardContent>
     </Card>
   );

@@ -13,6 +13,7 @@ import {
   RefundStatus,
 } from "~/db/schema";
 import { getHoursWatched } from "~/lib/hours-watched.server";
+import { formatPrice } from "~/lib/utils";
 
 function countLessons(db: Db, courseId: number) {
   const result = db
@@ -87,6 +88,13 @@ export class RefundRequestNotFoundError extends Error {
   }
 }
 
+export class DeclineNoteRequiredError extends Error {
+  constructor() {
+    super("A Decline Note is required to decline a Refund Request");
+    this.name = "DeclineNoteRequiredError";
+  }
+}
+
 /**
  * Approves an Open Refund Request. The full amount paid becomes the Refund
  * (an approved request with `amountRefunded` set is the Pending Refund), and
@@ -154,4 +162,104 @@ export function approveRefundRequest(
       amountRefunded: request.amountPaid,
     };
   });
+}
+
+export function declineRefundRequest(
+  db: Db,
+  {
+    refundRequestId,
+    staffUserId,
+    declineNote,
+  }: { refundRequestId: number; staffUserId: number; declineNote: string }
+) {
+  const note = declineNote.trim();
+  if (note === "") throw new DeclineNoteRequiredError();
+
+  return db.transaction((tx) => {
+    // Conditional on the request still being Open, so a concurrent second
+    // decision changes no rows and is refused: the first decision wins.
+    const { changes } = tx
+      .update(refunds)
+      .set({
+        status: RefundStatus.Declined,
+        declineNote: note,
+        resolvedAt: new Date().toISOString(),
+        resolvedByUserId: staffUserId,
+      })
+      .where(
+        and(
+          eq(refunds.id, refundRequestId),
+          eq(refunds.status, RefundStatus.Open)
+        )
+      )
+      .run();
+    if (changes === 0) throw new RefundRequestAlreadyDecidedError();
+
+    const declined = tx
+      .select({
+        learner: { name: users.name, email: users.email },
+        courseTitle: courses.title,
+      })
+      .from(refunds)
+      .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+      .innerJoin(users, eq(purchases.userId, users.id))
+      .innerJoin(courses, eq(purchases.courseId, courses.id))
+      .where(eq(refunds.id, refundRequestId))
+      .get();
+    if (!declined) throw new RefundRequestAlreadyDecidedError();
+
+    return { ...declined, declineNote: note };
+  });
+}
+
+/**
+ * The learner's email when Staff approve their Refund Request. There is no
+ * mail transport yet, so the caller writes the built message to the server log.
+ */
+export function buildApprovedRefundRequestEmail(decision: {
+  learner: { name: string; email: string };
+  courseTitle: string;
+  amountRefunded: number;
+}) {
+  return {
+    to: decision.learner.email,
+    subject: `Refund request approved — ${decision.courseTitle}`,
+    body: [
+      `Hi ${decision.learner.name},`,
+      "",
+      `We have approved your refund request for "${decision.courseTitle}".`,
+      `Your refund of ${formatPrice(decision.amountRefunded)}, the full amount you paid, is on its way.`,
+      "",
+      "You no longer have access to the course. Your progress is kept, so if you buy it again you will pick up where you left off.",
+      "",
+      "— The Cadence team",
+    ].join("\n"),
+  };
+}
+
+/**
+ * The learner's email when Staff decline their Refund Request. There is no
+ * mail transport yet, so the caller writes the built message to the server log.
+ */
+export function buildDeclinedRefundRequestEmail(decision: {
+  learner: { name: string; email: string };
+  courseTitle: string;
+  declineNote: string;
+}) {
+  return {
+    to: decision.learner.email,
+    subject: `Refund request declined — ${decision.courseTitle}`,
+    body: [
+      `Hi ${decision.learner.name},`,
+      "",
+      `We have reviewed your refund request for "${decision.courseTitle}" and declined it.`,
+      "",
+      "Note from our team:",
+      decision.declineNote,
+      "",
+      "You still have access to the course. If something has changed, you can raise a new refund request from the course page.",
+      "",
+      "— The Cadence team",
+    ].join("\n"),
+  };
 }

@@ -249,6 +249,8 @@ export const refunds = sqliteTable(
       .$defaultFn(() => new Date().toISOString()),
     resolvedAt: text("resolved_at"),
     resolvedByUserId: integer("resolved_by_user_id").references(() => users.id),
+    // Staff's reason for the learner, set only when a request is declined.
+    declineNote: text("decline_note"),
   },
   (table) => [index("refunds_purchase_idx").on(table.purchaseId)]
 );

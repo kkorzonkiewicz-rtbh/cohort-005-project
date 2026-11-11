@@ -4,6 +4,9 @@ import * as schema from "~/db/schema";
 import { eq } from "drizzle-orm";
 import {
   approveRefundRequest,
+  buildApprovedRefundRequestEmail,
+  buildDeclinedRefundRequestEmail,
+  declineRefundRequest,
   listRefundRequestsForStaff,
   RefundRequestAlreadyDecidedError,
 } from "./refund-decisions.server";
@@ -245,6 +248,171 @@ describe("listRefundRequestsForStaff", () => {
   });
 });
 
+describe("declineRefundRequest", () => {
+  function findRefundRequest(id: number) {
+    return testDb
+      .select()
+      .from(schema.refunds)
+      .where(eq(schema.refunds.id, id))
+      .get();
+  }
+
+  function addStaff() {
+    return testDb
+      .insert(schema.users)
+      .values({
+        name: "Staff Member",
+        email: "staff@example.com",
+        role: schema.UserRole.Admin,
+      })
+      .returning()
+      .get();
+  }
+
+  it("stores the outcome, Decline Note, decider and time, and keeps the learner's access", () => {
+    const staff = addStaff();
+    const purchase = buy(
+      base.user.id,
+      base.course.id,
+      "2026-11-01T10:00:00.000Z"
+    );
+    testDb
+      .insert(schema.enrollments)
+      .values({ userId: base.user.id, courseId: base.course.id })
+      .run();
+    const request = raiseRefundRequest(purchase.id, "2026-11-03T09:00:00.000Z");
+
+    declineRefundRequest(testDb, {
+      refundRequestId: request.id,
+      staffUserId: staff.id,
+      declineNote: "  You've watched most of the course.  ",
+    });
+
+    const declined = findRefundRequest(request.id);
+    expect(declined).toMatchObject({
+      status: schema.RefundStatus.Declined,
+      declineNote: "You've watched most of the course.",
+      resolvedByUserId: staff.id,
+      amountRefunded: null,
+    });
+    expect(declined?.resolvedAt).toEqual(expect.any(String));
+    // Declining never touches access: the learner keeps the course.
+    const enrollments = testDb
+      .select()
+      .from(schema.enrollments)
+      .where(eq(schema.enrollments.userId, base.user.id))
+      .all();
+    expect(enrollments).toHaveLength(1);
+  });
+
+  // No learner is turned down without a reason.
+  it.each(["", "   \n\t "])(
+    "refuses a Decline Note of %j and leaves the request Open",
+    (declineNote) => {
+      const staff = addStaff();
+      const purchase = buy(
+        base.user.id,
+        base.course.id,
+        "2026-11-01T10:00:00.000Z"
+      );
+      const request = raiseRefundRequest(
+        purchase.id,
+        "2026-11-03T09:00:00.000Z"
+      );
+
+      expect(() =>
+        declineRefundRequest(testDb, {
+          refundRequestId: request.id,
+          staffUserId: staff.id,
+          declineNote,
+        })
+      ).toThrow("A Decline Note is required");
+
+      expect(findRefundRequest(request.id)).toMatchObject({
+        status: schema.RefundStatus.Open,
+        declineNote: null,
+        resolvedAt: null,
+        resolvedByUserId: null,
+      });
+    }
+  );
+
+  // The first decision wins, so two Staff can't give conflicting answers.
+  it.each([schema.RefundStatus.Approved, schema.RefundStatus.Declined])(
+    "refuses to decline a request that is already %s, and changes nothing",
+    (status) => {
+      const staff = addStaff();
+      const purchase = buy(
+        base.user.id,
+        base.course.id,
+        "2026-11-01T10:00:00.000Z"
+      );
+      const request = raiseRefundRequest(
+        purchase.id,
+        "2026-11-03T09:00:00.000Z",
+        status
+      );
+
+      expect(() =>
+        declineRefundRequest(testDb, {
+          refundRequestId: request.id,
+          staffUserId: staff.id,
+          declineNote: "Too late.",
+        })
+      ).toThrow(RefundRequestAlreadyDecidedError);
+
+      expect(findRefundRequest(request.id)).toEqual(request);
+    }
+  );
+
+  it("refuses a second decline of the same request", () => {
+    const staff = addStaff();
+    const purchase = buy(
+      base.user.id,
+      base.course.id,
+      "2026-11-01T10:00:00.000Z"
+    );
+    const request = raiseRefundRequest(purchase.id, "2026-11-03T09:00:00.000Z");
+    declineRefundRequest(testDb, {
+      refundRequestId: request.id,
+      staffUserId: staff.id,
+      declineNote: "First answer.",
+    });
+
+    expect(() =>
+      declineRefundRequest(testDb, {
+        refundRequestId: request.id,
+        staffUserId: staff.id,
+        declineNote: "Second answer.",
+      })
+    ).toThrow("This Refund Request has already been decided");
+
+    expect(findRefundRequest(request.id)?.declineNote).toBe("First answer.");
+  });
+
+  it("returns a declined email for the learner that carries the Decline Note", () => {
+    const staff = addStaff();
+    const purchase = buy(
+      base.user.id,
+      base.course.id,
+      "2026-11-01T10:00:00.000Z"
+    );
+    const request = raiseRefundRequest(purchase.id, "2026-11-03T09:00:00.000Z");
+
+    const decision = declineRefundRequest(testDb, {
+      refundRequestId: request.id,
+      staffUserId: staff.id,
+      declineNote: "You've watched most of the course.",
+    });
+    const email = buildDeclinedRefundRequestEmail(decision);
+
+    expect(email.to).toBe("test@example.com");
+    expect(email.subject).toContain("Test Course");
+    expect(email.body).toContain("Hi Test User,");
+    expect(email.body).toContain("You've watched most of the course.");
+  });
+});
+
 describe("approveRefundRequest", () => {
   function staff() {
     return testDb
@@ -420,7 +588,7 @@ describe("approveRefundRequest", () => {
     expect(findRefundRequest(request.id)).toEqual(afterFirst);
   });
 
-  it("returns who to email, about which course and for how much", () => {
+  it("returns what the learner's approved email needs: who, which course and how much", () => {
     const decider = staff();
     const purchase = buy(
       base.user.id,
@@ -433,15 +601,11 @@ describe("approveRefundRequest", () => {
       refundRequestId: request.id,
       staffUserId: decider.id,
     });
+    const email = buildApprovedRefundRequestEmail(approved);
 
-    expect(approved).toEqual({
-      learner: {
-        id: base.user.id,
-        name: "Test User",
-        email: "test@example.com",
-      },
-      courseTitle: "Test Course",
-      amountRefunded: 7900,
-    });
+    expect(email.to).toBe("test@example.com");
+    expect(email.subject).toContain("Test Course");
+    expect(email.body).toContain("Hi Test User,");
+    expect(email.body).toContain("$79.00");
   });
 });
