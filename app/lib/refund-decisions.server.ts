@@ -71,3 +71,92 @@ export function listRefundRequestsForStaff(db: Db) {
 
   return { open };
 }
+
+export class RefundRequestAlreadyDecidedError extends Error {
+  constructor() {
+    super("This Refund Request has already been decided");
+    this.name = "RefundRequestAlreadyDecidedError";
+  }
+}
+
+export class DeclineNoteRequiredError extends Error {
+  constructor() {
+    super("A Decline Note is required to decline a Refund Request");
+    this.name = "DeclineNoteRequiredError";
+  }
+}
+
+export function declineRefundRequest(
+  db: Db,
+  {
+    refundRequestId,
+    staffUserId,
+    declineNote,
+  }: { refundRequestId: number; staffUserId: number; declineNote: string }
+) {
+  const note = declineNote.trim();
+  if (note === "") throw new DeclineNoteRequiredError();
+
+  return db.transaction((tx) => {
+    // Conditional on the request still being Open, so a concurrent second
+    // decision changes no rows and is refused: the first decision wins.
+    const { changes } = tx
+      .update(refunds)
+      .set({
+        status: RefundStatus.Declined,
+        declineNote: note,
+        resolvedAt: new Date().toISOString(),
+        resolvedByUserId: staffUserId,
+      })
+      .where(
+        and(
+          eq(refunds.id, refundRequestId),
+          eq(refunds.status, RefundStatus.Open)
+        )
+      )
+      .run();
+    if (changes === 0) throw new RefundRequestAlreadyDecidedError();
+
+    const declined = tx
+      .select({
+        learner: { name: users.name, email: users.email },
+        courseTitle: courses.title,
+      })
+      .from(refunds)
+      .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+      .innerJoin(users, eq(purchases.userId, users.id))
+      .innerJoin(courses, eq(purchases.courseId, courses.id))
+      .where(eq(refunds.id, refundRequestId))
+      .get();
+    if (!declined) throw new RefundRequestAlreadyDecidedError();
+
+    return { ...declined, declineNote: note };
+  });
+}
+
+/**
+ * The learner's email when Staff decline their Refund Request. There is no
+ * mail transport yet, so the caller writes the built message to the server log.
+ */
+export function buildDeclinedRefundRequestEmail(decision: {
+  learner: { name: string; email: string };
+  courseTitle: string;
+  declineNote: string;
+}) {
+  return {
+    to: decision.learner.email,
+    subject: `Refund request declined — ${decision.courseTitle}`,
+    body: [
+      `Hi ${decision.learner.name},`,
+      "",
+      `We have reviewed your refund request for "${decision.courseTitle}" and declined it.`,
+      "",
+      "Note from our team:",
+      decision.declineNote,
+      "",
+      "You still have access to the course. If something has changed, you can raise a new refund request from the course page.",
+      "",
+      "— The Cadence team",
+    ].join("\n"),
+  };
+}

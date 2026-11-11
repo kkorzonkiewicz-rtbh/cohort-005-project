@@ -2801,6 +2801,25 @@ This course is still in draft while the cluster examples are rewritten against t
 
   console.log("Created Sophia's Refund Request.");
 
+  // ─── Emma's Declined Refund Request ───
+  // A Closed Refund Request Staff turned down with a Decline Note. Declining
+  // leaves her enrollment and progress in course 1 as they were.
+
+  db.insert(schema.refunds)
+    .values({
+      purchaseId: purchase1.id, // Emma — course 1
+      status: RefundStatus.Declined,
+      reason: "I didn't enjoy the instructor's teaching style.",
+      requestedAt: daysAgo(48),
+      resolvedAt: daysAgo(47),
+      resolvedByUserId: admin.id,
+      declineNote:
+        "You've completed almost every lesson, so this is outside our refund policy. Reply to this email if something about the course didn't work for you.",
+    })
+    .run();
+
+  console.log("Created Emma's Declined Refund Request.");
+
   // ─── Flush watch events ───
   // Batched: the heartbeat makes these by far the largest table, and one
   // statement per row would dominate the seed's runtime.

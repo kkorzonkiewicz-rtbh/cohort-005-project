@@ -1,14 +1,37 @@
-import { data, isRouteErrorResponse, Link } from "react-router";
+import { useEffect, useState } from "react";
+import { data, isRouteErrorResponse, Link, useFetcher } from "react-router";
+import { toast } from "sonner";
+import { z } from "zod";
 import { eq } from "drizzle-orm";
 import type { Route } from "./+types/admin.refunds";
 import { getCurrentUserId } from "~/lib/session";
+import { parseFormData } from "~/lib/validation";
 import { UserRole, users } from "~/db/schema";
 import { db } from "~/db";
-import { listRefundRequestsForStaff } from "~/lib/refund-decisions.server";
+import {
+  buildDeclinedRefundRequestEmail,
+  declineRefundRequest,
+  DeclineNoteRequiredError,
+  listRefundRequestsForStaff,
+  RefundRequestAlreadyDecidedError,
+} from "~/lib/refund-decisions.server";
 import { formatPrice } from "~/lib/utils";
 import { Card, CardContent } from "~/components/ui/card";
 import { Button } from "~/components/ui/button";
+import { Label } from "~/components/ui/label";
+import { Textarea } from "~/components/ui/textarea";
 import { AlertTriangle, ReceiptText } from "lucide-react";
+
+const refundDecisionActionSchema = z.discriminatedUnion("intent", [
+  z.object({
+    intent: z.literal("decline"),
+    refundRequestId: z.coerce.number().int(),
+    declineNote: z
+      .string()
+      .trim()
+      .min(1, "Write a Decline Note so the learner knows why."),
+  }),
+]);
 
 export function meta() {
   return [
@@ -39,6 +62,101 @@ export async function loader({ request }: Route.LoaderArgs) {
   const { open } = listRefundRequestsForStaff(db);
 
   return { open };
+}
+
+export async function action({ request }: Route.ActionArgs) {
+  const currentUserId = await getCurrentUserId(request);
+
+  if (!currentUserId) {
+    throw data("Select a user from the DevUI panel to decide Refund Requests.", {
+      status: 401,
+    });
+  }
+
+  const currentUser = db
+    .select()
+    .from(users)
+    .where(eq(users.id, currentUserId))
+    .get();
+
+  if (!currentUser || currentUser.role !== UserRole.Admin) {
+    throw data("Only Staff can decide Refund Requests.", { status: 403 });
+  }
+
+  const formData = await request.formData();
+  const parsed = parseFormData(formData, refundDecisionActionSchema);
+
+  if (!parsed.success) {
+    return data(
+      { error: Object.values(parsed.errors)[0] ?? "Invalid input." },
+      { status: 400 }
+    );
+  }
+
+  if (parsed.data.intent === "decline") {
+    try {
+      const decision = declineRefundRequest(db, {
+        refundRequestId: parsed.data.refundRequestId,
+        staffUserId: currentUser.id,
+        declineNote: parsed.data.declineNote,
+      });
+
+      const email = buildDeclinedRefundRequestEmail(decision);
+      console.log(
+        `[email] to=${email.to} subject=${email.subject}\n${email.body}`
+      );
+
+      return { success: true, message: "Refund Request declined." };
+    } catch (e) {
+      if (e instanceof RefundRequestAlreadyDecidedError) {
+        return data({ error: e.message }, { status: 409 });
+      }
+      if (e instanceof DeclineNoteRequiredError) {
+        return data({ error: e.message }, { status: 400 });
+      }
+      throw e;
+    }
+  }
+
+  throw data("Invalid action.", { status: 400 });
+}
+
+function DeclineRefundRequestForm({ requestId }: { requestId: number }) {
+  const [declineNote, setDeclineNote] = useState("");
+  const fetcher = useFetcher<typeof action>();
+
+  useEffect(() => {
+    if (fetcher.state !== "idle" || !fetcher.data) return;
+    if ("error" in fetcher.data) toast.error(fetcher.data.error);
+    else toast.success(fetcher.data.message);
+  }, [fetcher.state, fetcher.data]);
+
+  const noteId = `decline-note-${requestId}`;
+
+  return (
+    <fetcher.Form method="post" className="space-y-2 border-t pt-4">
+      <input type="hidden" name="intent" value="decline" />
+      <input type="hidden" name="refundRequestId" value={requestId} />
+      <Label htmlFor={noteId}>Decline Note</Label>
+      <Textarea
+        id={noteId}
+        name="declineNote"
+        value={declineNote}
+        onChange={(e) => setDeclineNote(e.target.value)}
+        placeholder="Tell the learner why their Refund Request is declined."
+        required
+      />
+      <div className="flex justify-end">
+        <Button
+          type="submit"
+          variant="outline"
+          disabled={!declineNote.trim() || fetcher.state !== "idle"}
+        >
+          Decline
+        </Button>
+      </div>
+    </fetcher.Form>
+  );
 }
 
 function formatDate(iso: string) {
@@ -99,6 +217,8 @@ function OpenRefundRequestCard({ request }: { request: OpenRefundRequest }) {
           <p className="mb-1 text-muted-foreground">Reason</p>
           <p className="whitespace-pre-wrap">{request.reason}</p>
         </div>
+
+        <DeclineRefundRequestForm requestId={request.id} />
       </CardContent>
     </Card>
   );
