@@ -7,6 +7,7 @@ import {
   buildApprovedRefundRequestEmail,
   buildDeclinedRefundRequestEmail,
   declineRefundRequest,
+  isTeamSeatRedeemable,
   listRefundRequestsForLearner,
   listRefundRequestsForStaff,
   RefundRequestAlreadyDecidedError,
@@ -716,5 +717,79 @@ describe("approveRefundRequest", () => {
     expect(email.subject).toContain("Test Course");
     expect(email.body).toContain("Hi Test User,");
     expect(email.body).toContain("$79.00");
+  });
+});
+
+describe("approving a Team purchase", () => {
+  function buyTeamSeats(buyerId: number, seats: number) {
+    const team = testDb.insert(schema.teams).values({}).returning().get();
+    const purchase = buy(buyerId, base.course.id, "2026-11-01T10:00:00.000Z");
+    const codes = Array.from({ length: seats }, (_, i) => {
+      const code = `SEAT-${purchase.id}-${i}`;
+      testDb
+        .insert(schema.coupons)
+        .values({
+          teamId: team.id,
+          courseId: base.course.id,
+          purchaseId: purchase.id,
+          code,
+        })
+        .run();
+      return code;
+    });
+    return { purchase, codes };
+  }
+
+  it("voids every unclaimed Team Seat of the purchase, so none can be redeemed", () => {
+    const { purchase, codes } = buyTeamSeats(base.user.id, 3);
+    const request = raiseRefundRequest(purchase.id, "2026-11-03T09:00:00.000Z");
+
+    approveRefundRequest(testDb, {
+      refundRequestId: request.id,
+      staffUserId: base.instructor.id,
+    });
+
+    expect(codes.map((code) => isTeamSeatRedeemable(testDb, code))).toEqual([
+      false,
+      false,
+      false,
+    ]);
+  });
+
+  it("leaves Team Seats of other purchases redeemable", () => {
+    const refunded = buyTeamSeats(base.user.id, 2);
+    const other = buyTeamSeats(base.instructor.id, 2);
+    const request = raiseRefundRequest(
+      refunded.purchase.id,
+      "2026-11-03T09:00:00.000Z"
+    );
+
+    approveRefundRequest(testDb, {
+      refundRequestId: request.id,
+      staffUserId: base.instructor.id,
+    });
+
+    expect(
+      other.codes.map((code) => isTeamSeatRedeemable(testDb, code))
+    ).toEqual([true, true]);
+  });
+
+  it("treats an unvoided, unclaimed Team Seat as redeemable", () => {
+    const { codes } = buyTeamSeats(base.user.id, 1);
+
+    expect(isTeamSeatRedeemable(testDb, codes[0])).toBe(true);
+  });
+
+  it("does not void Team Seats when the Refund Request is declined", () => {
+    const { purchase, codes } = buyTeamSeats(base.user.id, 1);
+    const request = raiseRefundRequest(purchase.id, "2026-11-03T09:00:00.000Z");
+
+    declineRefundRequest(testDb, {
+      refundRequestId: request.id,
+      staffUserId: base.instructor.id,
+      declineNote: "Seats were shared already.",
+    });
+
+    expect(isTeamSeatRedeemable(testDb, codes[0])).toBe(true);
   });
 });

@@ -1,6 +1,7 @@
-import { and, asc, desc, eq, sql } from "drizzle-orm";
+import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
 import type { Db } from "~/db";
 import {
+  coupons,
   courses,
   enrollments,
   lessonProgress,
@@ -126,6 +127,7 @@ export class DeclineNoteRequiredError extends Error {
  * (an approved request with `amountRefunded` set is the Pending Refund), and
  * the learner loses access by losing every enrollment row for the course.
  * Progress, watch events, quiz attempts and ratings are kept (ADR 0001).
+ * On a Team purchase, every unclaimed Team Seat is voided (ADR 0002).
  *
  * The update only matches an Open request, so when two Staff decide at once
  * the first decision wins and the second is refused.
@@ -139,6 +141,7 @@ export function approveRefundRequest(
   return db.transaction((tx) => {
     const request = tx
       .select({
+        purchaseId: purchases.id,
         amountPaid: purchases.amountPaid,
         courseId: purchases.courseId,
         courseTitle: courses.title,
@@ -182,12 +185,45 @@ export function approveRefundRequest(
       )
       .run();
 
+    // A Team purchase is only refundable while no seat is claimed, but void
+    // just the unclaimed ones so a claimed seat is never taken away.
+    tx.update(coupons)
+      .set({ voidedAt: new Date().toISOString() })
+      .where(
+        and(
+          eq(coupons.purchaseId, request.purchaseId),
+          isNull(coupons.redeemedByUserId),
+          isNull(coupons.voidedAt)
+        )
+      )
+      .run();
+
     return {
       learner: request.learner,
       courseTitle: request.courseTitle,
       amountRefunded: request.amountPaid,
     };
   });
+}
+
+/**
+ * Whether a Team Seat code can still be redeemed: it exists, nobody has
+ * claimed it, and it was not voided by an approved Refund (ADR 0002).
+ */
+export function isTeamSeatRedeemable(db: Db, code: string) {
+  const seat = db
+    .select({ id: coupons.id })
+    .from(coupons)
+    .where(
+      and(
+        eq(coupons.code, code),
+        isNull(coupons.redeemedByUserId),
+        isNull(coupons.voidedAt)
+      )
+    )
+    .get();
+
+  return seat !== undefined;
 }
 
 export function declineRefundRequest(
