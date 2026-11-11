@@ -2,6 +2,7 @@ import { and, asc, desc, eq, sql } from "drizzle-orm";
 import type { Db } from "~/db";
 import {
   courses,
+  enrollments,
   lessonProgress,
   lessons,
   modules,
@@ -12,6 +13,7 @@ import {
   RefundStatus,
 } from "~/db/schema";
 import { getHoursWatched } from "~/lib/hours-watched.server";
+import { formatPrice } from "~/lib/utils";
 
 function countLessons(db: Db, courseId: number) {
   const result = db
@@ -105,11 +107,87 @@ export class RefundRequestAlreadyDecidedError extends Error {
   }
 }
 
+export class RefundRequestNotFoundError extends Error {
+  constructor() {
+    super("Refund Request not found");
+    this.name = "RefundRequestNotFoundError";
+  }
+}
+
 export class DeclineNoteRequiredError extends Error {
   constructor() {
     super("A Decline Note is required to decline a Refund Request");
     this.name = "DeclineNoteRequiredError";
   }
+}
+
+/**
+ * Approves an Open Refund Request. The full amount paid becomes the Refund
+ * (an approved request with `amountRefunded` set is the Pending Refund), and
+ * the learner loses access by losing every enrollment row for the course.
+ * Progress, watch events, quiz attempts and ratings are kept (ADR 0001).
+ *
+ * The update only matches an Open request, so when two Staff decide at once
+ * the first decision wins and the second is refused.
+ *
+ * Returns what the learner's approved email needs.
+ */
+export function approveRefundRequest(
+  db: Db,
+  input: { refundRequestId: number; staffUserId: number }
+) {
+  return db.transaction((tx) => {
+    const request = tx
+      .select({
+        amountPaid: purchases.amountPaid,
+        courseId: purchases.courseId,
+        courseTitle: courses.title,
+        learner: { id: users.id, name: users.name, email: users.email },
+      })
+      .from(refunds)
+      .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+      .innerJoin(users, eq(purchases.userId, users.id))
+      .innerJoin(courses, eq(purchases.courseId, courses.id))
+      .where(eq(refunds.id, input.refundRequestId))
+      .get();
+
+    if (!request) throw new RefundRequestNotFoundError();
+
+    const approved = tx
+      .update(refunds)
+      .set({
+        status: RefundStatus.Approved,
+        amountRefunded: request.amountPaid,
+        resolvedAt: new Date().toISOString(),
+        resolvedByUserId: input.staffUserId,
+      })
+      .where(
+        and(
+          eq(refunds.id, input.refundRequestId),
+          eq(refunds.status, RefundStatus.Open)
+        )
+      )
+      .returning({ amountRefunded: refunds.amountRefunded })
+      .get();
+
+    if (!approved) throw new RefundRequestAlreadyDecidedError();
+
+    // Nothing enforces one enrollment per learner and course, so remove them all.
+    tx.delete(enrollments)
+      .where(
+        and(
+          eq(enrollments.userId, request.learner.id),
+          eq(enrollments.courseId, request.courseId)
+        )
+      )
+      .run();
+
+    return {
+      learner: request.learner,
+      courseTitle: request.courseTitle,
+      amountRefunded: request.amountPaid,
+    };
+  });
 }
 
 export function declineRefundRequest(
@@ -158,6 +236,31 @@ export function declineRefundRequest(
 
     return { ...declined, declineNote: note };
   });
+}
+
+/**
+ * The learner's email when Staff approve their Refund Request. There is no
+ * mail transport yet, so the caller writes the built message to the server log.
+ */
+export function buildApprovedRefundRequestEmail(decision: {
+  learner: { name: string; email: string };
+  courseTitle: string;
+  amountRefunded: number;
+}) {
+  return {
+    to: decision.learner.email,
+    subject: `Refund request approved — ${decision.courseTitle}`,
+    body: [
+      `Hi ${decision.learner.name},`,
+      "",
+      `We have approved your refund request for "${decision.courseTitle}".`,
+      `Your refund of ${formatPrice(decision.amountRefunded)}, the full amount you paid, is on its way.`,
+      "",
+      "You no longer have access to the course. Your progress is kept, so if you buy it again you will pick up where you left off.",
+      "",
+      "— The Cadence team",
+    ].join("\n"),
+  };
 }
 
 /**

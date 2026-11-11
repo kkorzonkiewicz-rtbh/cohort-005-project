@@ -9,20 +9,38 @@ import { parseFormData } from "~/lib/validation";
 import { UserRole, users } from "~/db/schema";
 import { db } from "~/db";
 import {
+  approveRefundRequest,
+  buildApprovedRefundRequestEmail,
   buildDeclinedRefundRequestEmail,
   declineRefundRequest,
   DeclineNoteRequiredError,
   listRefundRequestsForStaff,
   RefundRequestAlreadyDecidedError,
+  RefundRequestNotFoundError,
 } from "~/lib/refund-decisions.server";
 import { formatPrice } from "~/lib/utils";
 import { Card, CardContent } from "~/components/ui/card";
 import { Button } from "~/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "~/components/ui/alert-dialog";
 import { Label } from "~/components/ui/label";
 import { Textarea } from "~/components/ui/textarea";
 import { AlertTriangle, ReceiptText } from "lucide-react";
 
 const refundDecisionActionSchema = z.discriminatedUnion("intent", [
+  z.object({
+    intent: z.literal("approve"),
+    refundRequestId: z.coerce.number().int(),
+  }),
   z.object({
     intent: z.literal("decline"),
     refundRequestId: z.coerce.number().int(),
@@ -68,9 +86,12 @@ export async function action({ request }: Route.ActionArgs) {
   const currentUserId = await getCurrentUserId(request);
 
   if (!currentUserId) {
-    throw data("Select a user from the DevUI panel to decide Refund Requests.", {
-      status: 401,
-    });
+    throw data(
+      "Select a user from the DevUI panel to decide Refund Requests.",
+      {
+        status: 401,
+      }
+    );
   }
 
   const currentUser = db
@@ -91,6 +112,33 @@ export async function action({ request }: Route.ActionArgs) {
       { error: Object.values(parsed.errors)[0] ?? "Invalid input." },
       { status: 400 }
     );
+  }
+
+  if (parsed.data.intent === "approve") {
+    try {
+      const decision = approveRefundRequest(db, {
+        refundRequestId: parsed.data.refundRequestId,
+        staffUserId: currentUser.id,
+      });
+
+      const email = buildApprovedRefundRequestEmail(decision);
+      console.log(
+        `[email] to=${email.to} subject=${email.subject}\n${email.body}`
+      );
+
+      return {
+        success: true,
+        message: `Approved the ${formatPrice(decision.amountRefunded)} refund to ${decision.learner.name}.`,
+      };
+    } catch (e) {
+      if (e instanceof RefundRequestAlreadyDecidedError) {
+        return data({ error: e.message }, { status: 409 });
+      }
+      if (e instanceof RefundRequestNotFoundError) {
+        return data({ error: e.message }, { status: 404 });
+      }
+      throw e;
+    }
   }
 
   if (parsed.data.intent === "decline") {
@@ -173,6 +221,53 @@ function formatHours(hours: number) {
 
 type OpenRefundRequest = Route.ComponentProps["loaderData"]["open"][number];
 
+function ApproveRefundRequestButton({
+  request,
+}: {
+  request: OpenRefundRequest;
+}) {
+  const fetcher = useFetcher<typeof action>();
+
+  useEffect(() => {
+    if (fetcher.state !== "idle" || !fetcher.data) return;
+    if ("error" in fetcher.data) toast.error(fetcher.data.error);
+    else toast.success(fetcher.data.message);
+  }, [fetcher.state, fetcher.data]);
+
+  function approve() {
+    fetcher.submit(
+      { intent: "approve", refundRequestId: request.id },
+      { method: "post" }
+    );
+  }
+
+  return (
+    <AlertDialog>
+      <AlertDialogTrigger asChild>
+        <Button size="sm" disabled={fetcher.state !== "idle"}>
+          Approve
+        </Button>
+      </AlertDialogTrigger>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Approve this Refund Request?</AlertDialogTitle>
+          <AlertDialogDescription>
+            Approve the {formatPrice(request.amountPaid)} refund to{" "}
+            {request.learner.name}? They'll lose access to {request.courseTitle}
+            .
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogAction onClick={approve}>
+            Approve refund
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
+
 function OpenRefundRequestCard({ request }: { request: OpenRefundRequest }) {
   return (
     <Card>
@@ -218,13 +313,19 @@ function OpenRefundRequestCard({ request }: { request: OpenRefundRequest }) {
           <p className="whitespace-pre-wrap">{request.reason}</p>
         </div>
 
+        <div className="flex justify-end">
+          <ApproveRefundRequestButton request={request} />
+        </div>
+
         <DeclineRefundRequestForm requestId={request.id} />
       </CardContent>
     </Card>
   );
 }
 
-export default function StaffRefundRequests({ loaderData }: Route.ComponentProps) {
+export default function StaffRefundRequests({
+  loaderData,
+}: Route.ComponentProps) {
   const { open } = loaderData;
 
   return (

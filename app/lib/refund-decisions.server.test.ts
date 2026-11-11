@@ -3,6 +3,8 @@ import { createTestDb, seedBaseData } from "~/test/setup";
 import * as schema from "~/db/schema";
 import { eq } from "drizzle-orm";
 import {
+  approveRefundRequest,
+  buildApprovedRefundRequestEmail,
   buildDeclinedRefundRequestEmail,
   declineRefundRequest,
   listRefundRequestsForLearner,
@@ -517,5 +519,202 @@ describe("listRefundRequestsForLearner", () => {
       declineNote: "You've watched most of the course.",
       resolvedAt: expect.any(String),
     });
+  });
+});
+
+describe("approveRefundRequest", () => {
+  function staff() {
+    return testDb
+      .insert(schema.users)
+      .values({
+        name: "Staff Member",
+        email: "staff@example.com",
+        role: schema.UserRole.Admin,
+      })
+      .returning()
+      .get();
+  }
+
+  function findRefundRequest(id: number) {
+    return testDb
+      .select()
+      .from(schema.refunds)
+      .where(eq(schema.refunds.id, id))
+      .get();
+  }
+
+  it("approves the request for the full amount paid, recording who decided and when", () => {
+    const decider = staff();
+    const purchase = buy(
+      base.user.id,
+      base.course.id,
+      "2026-11-01T10:00:00.000Z"
+    );
+    const request = raiseRefundRequest(purchase.id, "2026-11-03T09:00:00.000Z");
+
+    approveRefundRequest(testDb, {
+      refundRequestId: request.id,
+      staffUserId: decider.id,
+    });
+
+    const approved = findRefundRequest(request.id);
+    expect(approved).toMatchObject({
+      status: schema.RefundStatus.Approved,
+      amountRefunded: 7900,
+      resolvedByUserId: decider.id,
+    });
+    expect(approved?.resolvedAt).toEqual(expect.any(String));
+  });
+
+  function enroll(learnerId: number, courseId: number) {
+    testDb
+      .insert(schema.enrollments)
+      .values({ userId: learnerId, courseId })
+      .run();
+  }
+
+  function enrolledLearnerIds(courseId: number) {
+    return testDb
+      .select({ userId: schema.enrollments.userId })
+      .from(schema.enrollments)
+      .where(eq(schema.enrollments.courseId, courseId))
+      .all()
+      .map((row) => row.userId);
+  }
+
+  it("removes every enrollment the learner has for the course, so they lose access", () => {
+    const decider = staff();
+    // Nothing enforces one enrollment per learner and course, so a learner
+    // can hold two rows. Leaving either behind would keep the course open.
+    enroll(base.user.id, base.course.id);
+    enroll(base.user.id, base.course.id);
+    // Another learner on the same course keeps their access.
+    enroll(base.instructor.id, base.course.id);
+    const purchase = buy(
+      base.user.id,
+      base.course.id,
+      "2026-11-01T10:00:00.000Z"
+    );
+    const request = raiseRefundRequest(purchase.id, "2026-11-03T09:00:00.000Z");
+
+    approveRefundRequest(testDb, {
+      refundRequestId: request.id,
+      staffUserId: decider.id,
+    });
+
+    expect(enrolledLearnerIds(base.course.id)).toEqual([base.instructor.id]);
+  });
+
+  it("keeps the learner's progress, watch history, quiz attempts and rating", () => {
+    // ADR 0001: approval removes the enrollment only. The history is kept in
+    // case the refund is disputed, and so a re-purchase picks up where it left off.
+    const decider = staff();
+    const lesson = addLesson(base.course.id);
+    markLesson(base.user.id, lesson.id, schema.LessonProgressStatus.Completed);
+    watch(base.user.id, lesson.id, 600);
+    const quiz = testDb
+      .insert(schema.quizzes)
+      .values({ lessonId: lesson.id, title: "Quiz", passingScore: 0.7 })
+      .returning()
+      .get();
+    testDb
+      .insert(schema.quizAttempts)
+      .values({
+        userId: base.user.id,
+        quizId: quiz.id,
+        score: 0.9,
+        passed: true,
+      })
+      .run();
+    testDb
+      .insert(schema.courseRatings)
+      .values({ userId: base.user.id, courseId: base.course.id, rating: 4 })
+      .run();
+    enroll(base.user.id, base.course.id);
+    const purchase = buy(
+      base.user.id,
+      base.course.id,
+      "2026-11-01T10:00:00.000Z"
+    );
+    const request = raiseRefundRequest(purchase.id, "2026-11-03T09:00:00.000Z");
+
+    approveRefundRequest(testDb, {
+      refundRequestId: request.id,
+      staffUserId: decider.id,
+    });
+
+    expect(testDb.select().from(schema.lessonProgress).all()).toHaveLength(1);
+    expect(testDb.select().from(schema.videoWatchEvents).all()).toHaveLength(1);
+    expect(testDb.select().from(schema.quizAttempts).all()).toHaveLength(1);
+    expect(testDb.select().from(schema.courseRatings).all()).toHaveLength(1);
+  });
+
+  it("refuses a Closed request and changes nothing, so the first decision wins", () => {
+    const decider = staff();
+    enroll(base.user.id, base.course.id);
+    const purchase = buy(
+      base.user.id,
+      base.course.id,
+      "2026-11-01T10:00:00.000Z"
+    );
+    const declined = raiseRefundRequest(
+      purchase.id,
+      "2026-11-03T09:00:00.000Z",
+      schema.RefundStatus.Declined
+    );
+
+    expect(() =>
+      approveRefundRequest(testDb, {
+        refundRequestId: declined.id,
+        staffUserId: decider.id,
+      })
+    ).toThrow(new RefundRequestAlreadyDecidedError());
+
+    expect(findRefundRequest(declined.id)).toEqual(declined);
+    expect(enrolledLearnerIds(base.course.id)).toEqual([base.user.id]);
+  });
+
+  it("refuses a second approval of the same request", () => {
+    const decider = staff();
+    const purchase = buy(
+      base.user.id,
+      base.course.id,
+      "2026-11-01T10:00:00.000Z"
+    );
+    const request = raiseRefundRequest(purchase.id, "2026-11-03T09:00:00.000Z");
+    approveRefundRequest(testDb, {
+      refundRequestId: request.id,
+      staffUserId: decider.id,
+    });
+    const afterFirst = findRefundRequest(request.id);
+
+    expect(() =>
+      approveRefundRequest(testDb, {
+        refundRequestId: request.id,
+        staffUserId: base.instructor.id,
+      })
+    ).toThrow("This Refund Request has already been decided");
+    expect(findRefundRequest(request.id)).toEqual(afterFirst);
+  });
+
+  it("returns what the learner's approved email needs: who, which course and how much", () => {
+    const decider = staff();
+    const purchase = buy(
+      base.user.id,
+      base.course.id,
+      "2026-11-01T10:00:00.000Z"
+    );
+    const request = raiseRefundRequest(purchase.id, "2026-11-03T09:00:00.000Z");
+
+    const approved = approveRefundRequest(testDb, {
+      refundRequestId: request.id,
+      staffUserId: decider.id,
+    });
+    const email = buildApprovedRefundRequestEmail(approved);
+
+    expect(email.to).toBe("test@example.com");
+    expect(email.subject).toContain("Test Course");
+    expect(email.body).toContain("Hi Test User,");
+    expect(email.body).toContain("$79.00");
   });
 });

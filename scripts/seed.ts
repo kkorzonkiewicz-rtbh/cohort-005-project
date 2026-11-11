@@ -1785,7 +1785,9 @@ This course is still in draft while the cluster examples are rewritten against t
   // Varied enrollment patterns:
   // - Emma: enrolled in both courses (nearly complete in course 1, mid-way in course 2)
   // - James: enrolled in course 1 only (completed)
-  // - Olivia: enrolled in both courses (just started course 1, mid-way in course 2)
+  // - Olivia: enrolled in course 2 only (mid-way). She started course 1 too,
+  //   but her Refund Request for it was approved, so that enrollment is gone
+  //   and her course 1 progress is kept (see "Olivia's Refund Request").
   // - Liam: enrolled in course 2 only (just started, abandoned)
   // - Sophia: enrolled in course 1 only (recently enrolled, barely started)
 
@@ -1799,7 +1801,6 @@ This course is still in draft while the cluster examples are rewritten against t
         enrolledAt: daysAgo(45),
         completedAt: daysAgo(10),
       },
-      { userId: students[2].id, courseId: course1.id, enrolledAt: daysAgo(35) },
       { userId: students[2].id, courseId: course2.id, enrolledAt: daysAgo(30) },
       { userId: students[3].id, courseId: course2.id, enrolledAt: daysAgo(25) },
       { userId: students[4].id, courseId: course1.id, enrolledAt: daysAgo(15) },
@@ -2257,7 +2258,8 @@ This course is still in draft while the cluster examples are rewritten against t
     })
     .run();
 
-  db.insert(schema.purchases)
+  const [oliviaPurchase] = db
+    .insert(schema.purchases)
     .values({
       userId: students[2].id, // Olivia — bought course 1 individually
       courseId: course1.id,
@@ -2265,7 +2267,8 @@ This course is still in draft while the cluster examples are rewritten against t
       country: "US",
       createdAt: daysAgo(35),
     })
-    .run();
+    .returning()
+    .all();
 
   const [sophiaPurchase] = db
     .insert(schema.purchases)
@@ -2800,6 +2803,27 @@ This course is still in draft while the cluster examples are rewritten against t
     .run();
 
   console.log("Created Sophia's Refund Request.");
+
+  // ─── Olivia's Refund Request ───
+  // An Approved Refund Request. Approval records the full amount paid as the
+  // Refund (still Pending — no payments system yet) and removes her course 1
+  // enrollment, which is why the enrollments above leave it out. Her course 1
+  // progress, watch history and quiz attempts stay (ADR 0001).
+
+  db.insert(schema.refunds)
+    .values({
+      purchaseId: oliviaPurchase.id,
+      status: RefundStatus.Approved,
+      reason:
+        "My employer ended up buying the course for the whole team, so I don't need my own copy.",
+      amountRefunded: oliviaPurchase.amountPaid,
+      requestedAt: daysAgo(27),
+      resolvedAt: daysAgo(26),
+      resolvedByUserId: admin.id,
+    })
+    .run();
+
+  console.log("Created Olivia's Refund Request.");
 
   // ─── Emma's Declined Refund Request ───
   // A Closed Refund Request Staff turned down with a Decline Note. Declining
