@@ -1,13 +1,33 @@
-import { data, isRouteErrorResponse, Link } from "react-router";
+import { useEffect } from "react";
+import { data, isRouteErrorResponse, Link, useFetcher } from "react-router";
 import { eq } from "drizzle-orm";
+import { toast } from "sonner";
+import { z } from "zod";
 import type { Route } from "./+types/admin.refunds";
 import { getCurrentUserId } from "~/lib/session";
+import { parseFormData } from "~/lib/validation";
 import { UserRole, users } from "~/db/schema";
 import { db } from "~/db";
-import { listRefundRequestsForStaff } from "~/lib/refund-decisions.server";
+import {
+  approveRefundRequest,
+  listRefundRequestsForStaff,
+  RefundRequestAlreadyDecidedError,
+  RefundRequestNotFoundError,
+} from "~/lib/refund-decisions.server";
 import { formatPrice } from "~/lib/utils";
 import { Card, CardContent } from "~/components/ui/card";
 import { Button } from "~/components/ui/button";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+  AlertDialogTrigger,
+} from "~/components/ui/alert-dialog";
 import { AlertTriangle, ReceiptText } from "lucide-react";
 
 export function meta() {
@@ -17,7 +37,14 @@ export function meta() {
   ];
 }
 
-export async function loader({ request }: Route.LoaderArgs) {
+const refundDecisionSchema = z.discriminatedUnion("intent", [
+  z.object({
+    intent: z.literal("approve"),
+    refundRequestId: z.coerce.number().int(),
+  }),
+]);
+
+async function requireStaff(request: Request) {
   const currentUserId = await getCurrentUserId(request);
 
   if (!currentUserId) {
@@ -36,9 +63,83 @@ export async function loader({ request }: Route.LoaderArgs) {
     throw data("Only Staff can see Refund Requests.", { status: 403 });
   }
 
+  return currentUser;
+}
+
+export async function loader({ request }: Route.LoaderArgs) {
+  await requireStaff(request);
+
   const { open } = listRefundRequestsForStaff(db);
 
   return { open };
+}
+
+/**
+ * The learner's approved email. There is no mail transport wired up yet, so
+ * the built message goes to the server log.
+ */
+function buildRefundApprovedEmail(approved: {
+  learner: { name: string; email: string };
+  courseTitle: string;
+  amountRefunded: number;
+}) {
+  return {
+    to: approved.learner.email,
+    subject: `Refund approved — ${approved.courseTitle}`,
+    body: [
+      `Hi ${approved.learner.name},`,
+      "",
+      `We've approved your Refund Request for "${approved.courseTitle}".`,
+      `Your Refund of ${formatPrice(approved.amountRefunded)}, the full amount you paid, is on its way.`,
+      "",
+      "You no longer have access to the course. Your progress is kept, so if you buy it again you'll pick up where you left off.",
+      "",
+      "— The Cadence team",
+    ].join("\n"),
+  };
+}
+
+export async function action({ request }: Route.ActionArgs) {
+  const staff = await requireStaff(request);
+
+  const formData = await request.formData();
+  const parsed = parseFormData(formData, refundDecisionSchema);
+
+  if (!parsed.success) {
+    return data(
+      { error: Object.values(parsed.errors)[0] ?? "Invalid input." },
+      { status: 400 }
+    );
+  }
+
+  if (parsed.data.intent === "approve") {
+    try {
+      const approved = approveRefundRequest(db, {
+        refundRequestId: parsed.data.refundRequestId,
+        staffUserId: staff.id,
+      });
+
+      const email = buildRefundApprovedEmail(approved);
+      console.log(
+        `[email] to=${email.to} subject=${email.subject}\n${email.body}`
+      );
+
+      return {
+        success: true,
+        message: `Approved the ${formatPrice(approved.amountRefunded)} refund to ${approved.learner.name}.`,
+      };
+    } catch (e) {
+      if (e instanceof RefundRequestAlreadyDecidedError) {
+        return data({ error: e.message }, { status: 409 });
+      }
+      if (e instanceof RefundRequestNotFoundError) {
+        return data({ error: e.message }, { status: 404 });
+      }
+      throw e;
+    }
+  }
+
+  throw data("Invalid action.", { status: 400 });
 }
 
 function formatDate(iso: string) {
@@ -54,6 +155,53 @@ function formatHours(hours: number) {
 }
 
 type OpenRefundRequest = Route.ComponentProps["loaderData"]["open"][number];
+
+function ApproveRefundRequestButton({
+  request,
+}: {
+  request: OpenRefundRequest;
+}) {
+  const fetcher = useFetcher<typeof action>();
+
+  useEffect(() => {
+    if (fetcher.state !== "idle" || !fetcher.data) return;
+    if ("error" in fetcher.data) toast.error(fetcher.data.error);
+    else toast.success(fetcher.data.message);
+  }, [fetcher.state, fetcher.data]);
+
+  function approve() {
+    fetcher.submit(
+      { intent: "approve", refundRequestId: request.id },
+      { method: "post" }
+    );
+  }
+
+  return (
+    <AlertDialog>
+      <AlertDialogTrigger asChild>
+        <Button size="sm" disabled={fetcher.state !== "idle"}>
+          Approve
+        </Button>
+      </AlertDialogTrigger>
+      <AlertDialogContent>
+        <AlertDialogHeader>
+          <AlertDialogTitle>Approve this Refund Request?</AlertDialogTitle>
+          <AlertDialogDescription>
+            Approve the {formatPrice(request.amountPaid)} refund to{" "}
+            {request.learner.name}? They'll lose access to {request.courseTitle}
+            .
+          </AlertDialogDescription>
+        </AlertDialogHeader>
+        <AlertDialogFooter>
+          <AlertDialogCancel>Cancel</AlertDialogCancel>
+          <AlertDialogAction onClick={approve}>
+            Approve refund
+          </AlertDialogAction>
+        </AlertDialogFooter>
+      </AlertDialogContent>
+    </AlertDialog>
+  );
+}
 
 function OpenRefundRequestCard({ request }: { request: OpenRefundRequest }) {
   return (
@@ -99,12 +247,18 @@ function OpenRefundRequestCard({ request }: { request: OpenRefundRequest }) {
           <p className="mb-1 text-muted-foreground">Reason</p>
           <p className="whitespace-pre-wrap">{request.reason}</p>
         </div>
+
+        <div className="flex justify-end gap-2">
+          <ApproveRefundRequestButton request={request} />
+        </div>
       </CardContent>
     </Card>
   );
 }
 
-export default function StaffRefundRequests({ loaderData }: Route.ComponentProps) {
+export default function StaffRefundRequests({
+  loaderData,
+}: Route.ComponentProps) {
   const { open } = loaderData;
 
   return (

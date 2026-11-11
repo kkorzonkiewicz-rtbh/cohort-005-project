@@ -2,6 +2,7 @@ import { and, asc, eq, sql } from "drizzle-orm";
 import type { Db } from "~/db";
 import {
   courses,
+  enrollments,
   lessonProgress,
   lessons,
   modules,
@@ -70,4 +71,87 @@ export function listRefundRequestsForStaff(db: Db) {
   }));
 
   return { open };
+}
+
+export class RefundRequestAlreadyDecidedError extends Error {
+  constructor() {
+    super("This Refund Request has already been decided");
+    this.name = "RefundRequestAlreadyDecidedError";
+  }
+}
+
+export class RefundRequestNotFoundError extends Error {
+  constructor() {
+    super("Refund Request not found");
+    this.name = "RefundRequestNotFoundError";
+  }
+}
+
+/**
+ * Approves an Open Refund Request. The full amount paid becomes the Refund
+ * (an approved request with `amountRefunded` set is the Pending Refund), and
+ * the learner loses access by losing every enrollment row for the course.
+ * Progress, watch events, quiz attempts and ratings are kept (ADR 0001).
+ *
+ * The update only matches an Open request, so when two Staff decide at once
+ * the first decision wins and the second is refused.
+ *
+ * Returns what the learner's approved email needs.
+ */
+export function approveRefundRequest(
+  db: Db,
+  input: { refundRequestId: number; staffUserId: number }
+) {
+  return db.transaction((tx) => {
+    const request = tx
+      .select({
+        amountPaid: purchases.amountPaid,
+        courseId: purchases.courseId,
+        courseTitle: courses.title,
+        learner: { id: users.id, name: users.name, email: users.email },
+      })
+      .from(refunds)
+      .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+      .innerJoin(users, eq(purchases.userId, users.id))
+      .innerJoin(courses, eq(purchases.courseId, courses.id))
+      .where(eq(refunds.id, input.refundRequestId))
+      .get();
+
+    if (!request) throw new RefundRequestNotFoundError();
+
+    const approved = tx
+      .update(refunds)
+      .set({
+        status: RefundStatus.Approved,
+        amountRefunded: request.amountPaid,
+        resolvedAt: new Date().toISOString(),
+        resolvedByUserId: input.staffUserId,
+      })
+      .where(
+        and(
+          eq(refunds.id, input.refundRequestId),
+          eq(refunds.status, RefundStatus.Open)
+        )
+      )
+      .returning({ amountRefunded: refunds.amountRefunded })
+      .get();
+
+    if (!approved) throw new RefundRequestAlreadyDecidedError();
+
+    // Nothing enforces one enrollment per learner and course, so remove them all.
+    tx.delete(enrollments)
+      .where(
+        and(
+          eq(enrollments.userId, request.learner.id),
+          eq(enrollments.courseId, request.courseId)
+        )
+      )
+      .run();
+
+    return {
+      learner: request.learner,
+      courseTitle: request.courseTitle,
+      amountRefunded: request.amountPaid,
+    };
+  });
 }
