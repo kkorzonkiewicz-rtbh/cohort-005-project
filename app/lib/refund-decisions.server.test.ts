@@ -2,15 +2,17 @@ import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createTestDb, seedBaseData } from "~/test/setup";
 import * as schema from "~/db/schema";
 import { eq } from "drizzle-orm";
+import { isRedeemable } from "~/lib/team-seats.server";
 import {
   approveRefundRequest,
   buildApprovedRefundRequestEmail,
   buildDeclinedRefundRequestEmail,
   declineRefundRequest,
-  isTeamSeatRedeemable,
   listRefundRequestsForLearner,
   listRefundRequestsForStaff,
   RefundRequestAlreadyDecidedError,
+  RefundRequestNotFoundError,
+  TeamSeatClaimedError,
 } from "./refund-decisions.server";
 
 let testDb: ReturnType<typeof createTestDb>;
@@ -305,8 +307,8 @@ describe("listRefundRequestsForStaff", () => {
           requestedAt: "2026-11-03T09:00:00.000Z",
           reason: "Bought the wrong one.",
           status: schema.RefundStatus.Declined,
-          decidedAt: "2026-11-04T12:00:00.000Z",
-          decidedBy: { id: staff.id, name: "Staff Member" },
+          closedAt: "2026-11-04T12:00:00.000Z",
+          closedBy: { id: staff.id, name: "Staff Member" },
           declineNote: "You've watched most of the course.",
         },
       ]);
@@ -357,14 +359,14 @@ describe("listRefundRequestsForStaff", () => {
         expect.objectContaining({
           id: decidedLast.id,
           status: schema.RefundStatus.Declined,
-          decidedAt: "2026-10-09T12:00:00.000Z",
+          closedAt: "2026-10-09T12:00:00.000Z",
         }),
         expect.objectContaining({
           id: decidedFirst.id,
           learner: expect.objectContaining({ name: "Test Instructor" }),
           status: schema.RefundStatus.Approved,
-          decidedAt: "2026-10-07T12:00:00.000Z",
-          decidedBy: { id: staff.id, name: "Staff Member" },
+          closedAt: "2026-10-07T12:00:00.000Z",
+          closedBy: { id: staff.id, name: "Staff Member" },
           declineNote: null,
         }),
       ]);
@@ -514,6 +516,18 @@ describe("declineRefundRequest", () => {
     expect(findRefundRequest(request.id)?.declineNote).toBe("First answer.");
   });
 
+  it("refuses a Refund Request that doesn't exist as not found", () => {
+    const staff = addStaff();
+
+    expect(() =>
+      declineRefundRequest(testDb, {
+        refundRequestId: 999,
+        staffUserId: staff.id,
+        declineNote: "Too late.",
+      })
+    ).toThrow(RefundRequestNotFoundError);
+  });
+
   it("returns a declined email for the learner that carries the Decline Note", () => {
     const staff = addStaff();
     const purchase = buy(
@@ -587,7 +601,7 @@ describe("listRefundRequestsForLearner", () => {
         reason: "Bought the wrong one.",
         status: schema.RefundStatus.Open,
         requestedAt: "2026-11-03T09:00:00.000Z",
-        resolvedAt: null,
+        closedAt: null,
         declineNote: null,
       },
     ]);
@@ -640,7 +654,7 @@ describe("listRefundRequestsForLearner", () => {
       id: request.id,
       status: schema.RefundStatus.Declined,
       declineNote: "You've watched most of the course.",
-      resolvedAt: expect.any(String),
+      closedAt: expect.any(String),
     });
   });
 });
@@ -843,6 +857,15 @@ describe("approveRefundRequest", () => {
 });
 
 describe("approving a Team purchase", () => {
+  function seatIsRedeemable(code: string) {
+    const seat = testDb
+      .select()
+      .from(schema.coupons)
+      .where(eq(schema.coupons.code, code))
+      .get();
+    return seat !== undefined && isRedeemable(seat);
+  }
+
   function buyTeamSeats(buyerId: number, seats: number) {
     const team = testDb.insert(schema.teams).values({}).returning().get();
     const purchase = buy(buyerId, base.course.id, "2026-11-01T10:00:00.000Z");
@@ -871,7 +894,7 @@ describe("approving a Team purchase", () => {
       staffUserId: base.instructor.id,
     });
 
-    expect(codes.map((code) => isTeamSeatRedeemable(testDb, code))).toEqual([
+    expect(codes.map((code) => seatIsRedeemable(code))).toEqual([
       false,
       false,
       false,
@@ -892,14 +915,45 @@ describe("approving a Team purchase", () => {
     });
 
     expect(
-      other.codes.map((code) => isTeamSeatRedeemable(testDb, code))
+      other.codes.map((code) => seatIsRedeemable(code))
     ).toEqual([true, true]);
   });
 
   it("treats an unvoided, unclaimed Team Seat as redeemable", () => {
     const { codes } = buyTeamSeats(base.user.id, 1);
 
-    expect(isTeamSeatRedeemable(testDb, codes[0])).toBe(true);
+    expect(seatIsRedeemable(codes[0])).toBe(true);
+  });
+
+  // A claimed Team Seat can't be refunded, even if it was claimed after the
+  // Refund Request was raised.
+  it("refuses to approve once a Team Seat of the purchase is claimed, and changes nothing", () => {
+    const { purchase, codes } = buyTeamSeats(base.user.id, 2);
+    const request = raiseRefundRequest(purchase.id, "2026-11-03T09:00:00.000Z");
+    testDb
+      .update(schema.coupons)
+      .set({
+        redeemedByUserId: base.instructor.id,
+        redeemedAt: "2026-11-04T09:00:00.000Z",
+      })
+      .where(eq(schema.coupons.code, codes[0]))
+      .run();
+
+    expect(() =>
+      approveRefundRequest(testDb, {
+        refundRequestId: request.id,
+        staffUserId: base.instructor.id,
+      })
+    ).toThrow(TeamSeatClaimedError);
+
+    expect(
+      testDb
+        .select()
+        .from(schema.refunds)
+        .where(eq(schema.refunds.id, request.id))
+        .get()
+    ).toEqual(request);
+    expect(seatIsRedeemable(codes[1])).toBe(true);
   });
 
   it("does not void Team Seats when the Refund Request is declined", () => {
@@ -912,6 +966,6 @@ describe("approving a Team purchase", () => {
       declineNote: "Seats were shared already.",
     });
 
-    expect(isTeamSeatRedeemable(testDb, codes[0])).toBe(true);
+    expect(seatIsRedeemable(codes[0])).toBe(true);
   });
 });

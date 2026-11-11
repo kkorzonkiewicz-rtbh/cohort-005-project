@@ -15,6 +15,7 @@ import { and, eq, isNotNull, sql } from "drizzle-orm";
 import { parseFormData, parseParams } from "~/lib/validation";
 import { formatPrice } from "~/lib/utils";
 import { getHoursWatched } from "~/lib/hours-watched.server";
+import { sendEmail } from "~/lib/email.server";
 
 const REFUND_WINDOW_DAYS = 14;
 const MAX_WATCHED_HOURS = 2;
@@ -186,9 +187,7 @@ export async function action({ params, request }: Route.ActionArgs) {
     amount: purchase.amountPaid,
   });
 
-  console.log(
-    `[email] to=${email.to} subject=${email.subject}\n${email.body}`
-  );
+  sendEmail(email);
 
   return redirect("/settings");
 }

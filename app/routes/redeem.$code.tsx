@@ -5,7 +5,11 @@ import { z } from "zod";
 import type { Route } from "./+types/redeem.$code";
 import { getCurrentUserId } from "~/lib/session";
 import { resolveCountry } from "~/lib/country.server";
-import { isTeamSeatRedeemable } from "~/lib/refund-decisions.server";
+import {
+  isRedeemable,
+  redeemTeamSeat,
+  TEAM_SEAT_VOIDED_MESSAGE,
+} from "~/lib/team-seats.server";
 import { parseParams, parseFormData } from "~/lib/validation";
 import { Card, CardContent } from "~/components/ui/card";
 import { Button } from "~/components/ui/button";
@@ -33,76 +37,6 @@ function isUserEnrolled(userId: number, courseId: number) {
     .get();
 
   return !!existing;
-}
-
-const VOIDED_MESSAGE = "This code no longer works";
-
-type RedeemResult =
-  | { ok: true; enrollment: typeof enrollments.$inferSelect }
-  | { ok: false; error: string };
-
-function redeemCoupon(
-  code: string,
-  userId: number,
-  userCountry: string
-): RedeemResult {
-  const coupon = getCouponByCode(code);
-  if (!coupon) {
-    return { ok: false, error: "Coupon not found" };
-  }
-
-  if (coupon.redeemedByUserId !== null) {
-    return { ok: false, error: "Coupon has already been redeemed" };
-  }
-
-  if (!isTeamSeatRedeemable(db, code)) {
-    return { ok: false, error: VOIDED_MESSAGE };
-  }
-
-  const existingEnrollment = db
-    .select()
-    .from(enrollments)
-    .where(
-      and(
-        eq(enrollments.userId, userId),
-        eq(enrollments.courseId, coupon.courseId)
-      )
-    )
-    .get();
-
-  if (existingEnrollment) {
-    return { ok: false, error: "You are already enrolled in this course" };
-  }
-
-  const purchase = db
-    .select()
-    .from(purchases)
-    .where(eq(purchases.id, coupon.purchaseId))
-    .get();
-
-  if (purchase?.country && purchase.country !== userCountry) {
-    return {
-      ok: false,
-      error:
-        "This coupon can only be redeemed from the same country as the purchaser",
-    };
-  }
-
-  db.update(coupons)
-    .set({
-      redeemedByUserId: userId,
-      redeemedAt: new Date().toISOString(),
-    })
-    .where(eq(coupons.id, coupon.id))
-    .run();
-
-  const enrollment = db
-    .insert(enrollments)
-    .values({ userId, courseId: coupon.courseId })
-    .returning()
-    .get();
-
-  return { ok: true, enrollment };
 }
 
 const redeemParamsSchema = z.object({
@@ -143,7 +77,7 @@ export async function loader({ params, request }: Route.LoaderArgs) {
 
   const alreadyRedeemed = coupon.redeemedByUserId !== null;
   // An unclaimed Team Seat that isn't redeemable was voided by a Refund.
-  const voided = !alreadyRedeemed && !isTeamSeatRedeemable(db, code);
+  const voided = !alreadyRedeemed && !isRedeemable(coupon);
   const alreadyEnrolled = isUserEnrolled(currentUserId, coupon.courseId);
 
   // Check country mismatch upfront so we can show a clear message
@@ -186,7 +120,11 @@ export async function action({ params, request }: Route.ActionArgs) {
   }
 
   const userCountry = await resolveCountry(request);
-  const result = redeemCoupon(code, currentUserId, userCountry ?? "");
+  const result = redeemTeamSeat(db, {
+    code,
+    learnerId: currentUserId,
+    learnerCountry: userCountry ?? "",
+  });
 
   if (!result.ok) {
     return data({ error: result.error }, { status: 400 });
@@ -263,7 +201,7 @@ export default function Redeem({
             <div className="rounded-lg bg-destructive/10 p-4">
               <div className="flex items-center justify-center gap-2 text-destructive">
                 <AlertCircle className="size-5" />
-                <span className="font-medium">{VOIDED_MESSAGE}</span>
+                <span className="font-medium">{TEAM_SEAT_VOIDED_MESSAGE}</span>
               </div>
               <p className="mt-2 text-sm text-muted-foreground">
                 The Team purchase this seat came from was refunded, so the seat
