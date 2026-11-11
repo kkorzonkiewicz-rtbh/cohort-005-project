@@ -6,7 +6,7 @@ import { eq } from "drizzle-orm";
 import type { Route } from "./+types/admin.refunds";
 import { getCurrentUserId } from "~/lib/session";
 import { parseFormData } from "~/lib/validation";
-import { UserRole, users } from "~/db/schema";
+import { RefundStatus, UserRole, users } from "~/db/schema";
 import { db } from "~/db";
 import {
   approveRefundRequest,
@@ -77,9 +77,9 @@ export async function loader({ request }: Route.LoaderArgs) {
     throw data("Only Staff can see Refund Requests.", { status: 403 });
   }
 
-  const { open } = listRefundRequestsForStaff(db);
+  const { open, closed } = listRefundRequestsForStaff(db);
 
-  return { open };
+  return { open, closed };
 }
 
 export async function action({ request }: Route.ActionArgs) {
@@ -323,10 +323,82 @@ function OpenRefundRequestCard({ request }: { request: OpenRefundRequest }) {
   );
 }
 
+type ClosedRefundRequest = Route.ComponentProps["loaderData"]["closed"][number];
+
+function ClosedRefundRequestCard({
+  request,
+}: {
+  request: ClosedRefundRequest;
+}) {
+  const approved = request.status === RefundStatus.Approved;
+
+  return (
+    <Card>
+      <CardContent className="space-y-4 p-5">
+        <div className="flex flex-wrap items-start justify-between gap-2">
+          <div>
+            <p className="font-medium">{request.learner.name}</p>
+            <p className="text-sm text-muted-foreground">
+              {request.learner.email}
+            </p>
+          </div>
+          <div className="text-right">
+            <p className="font-medium">{formatPrice(request.amountPaid)}</p>
+            <p className="text-sm text-muted-foreground">
+              {request.courseTitle}
+            </p>
+          </div>
+        </div>
+
+        <dl className="grid grid-cols-2 gap-x-6 gap-y-2 text-sm sm:grid-cols-4">
+          <div>
+            <dt className="text-muted-foreground">Outcome</dt>
+            <dd>
+              <span
+                className={
+                  approved
+                    ? "rounded-full bg-primary px-2 py-0.5 text-xs font-medium text-primary-foreground"
+                    : "rounded-full bg-muted px-2 py-0.5 text-xs font-medium"
+                }
+              >
+                {approved ? "Approved" : "Declined"}
+              </span>
+            </dd>
+          </div>
+          <div>
+            <dt className="text-muted-foreground">Decided by</dt>
+            <dd>{request.decidedBy?.name ?? "Unknown"}</dd>
+          </div>
+          <div>
+            <dt className="text-muted-foreground">Decided</dt>
+            <dd>{request.decidedAt ? formatDate(request.decidedAt) : "—"}</dd>
+          </div>
+          <div>
+            <dt className="text-muted-foreground">Requested</dt>
+            <dd>{formatDate(request.requestedAt)}</dd>
+          </div>
+        </dl>
+
+        <div className="text-sm">
+          <p className="mb-1 text-muted-foreground">Reason</p>
+          <p className="whitespace-pre-wrap">{request.reason}</p>
+        </div>
+
+        {!approved && request.declineNote && (
+          <div className="text-sm">
+            <p className="mb-1 text-muted-foreground">Decline Note</p>
+            <p className="whitespace-pre-wrap">{request.declineNote}</p>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function StaffRefundRequests({
   loaderData,
 }: Route.ComponentProps) {
-  const { open } = loaderData;
+  const { open, closed } = loaderData;
 
   return (
     <div className="mx-auto max-w-7xl p-6 lg:p-8">
@@ -341,7 +413,8 @@ export default function StaffRefundRequests({
       <div className="mb-8">
         <h1 className="text-3xl font-bold">Refund Requests</h1>
         <p className="mt-1 text-muted-foreground">
-          Open Refund Requests, oldest first
+          Open Refund Requests oldest first, then Closed ones newest decision
+          first
         </p>
       </div>
 
@@ -360,6 +433,26 @@ export default function StaffRefundRequests({
         <div className="space-y-4">
           {open.map((request) => (
             <OpenRefundRequestCard key={request.id} request={request} />
+          ))}
+        </div>
+      )}
+
+      <h2 className="mt-10 mb-4 text-lg font-semibold">
+        Closed ({closed.length})
+      </h2>
+
+      {closed.length === 0 ? (
+        <Card>
+          <CardContent className="py-8 text-center">
+            <p className="text-muted-foreground">
+              No Closed Refund Requests yet.
+            </p>
+          </CardContent>
+        </Card>
+      ) : (
+        <div className="space-y-4">
+          {closed.map((request) => (
+            <ClosedRefundRequestCard key={request.id} request={request} />
           ))}
         </div>
       )}
