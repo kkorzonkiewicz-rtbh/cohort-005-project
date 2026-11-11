@@ -17,7 +17,10 @@ import {
   listRefundRequestsForStaff,
   RefundRequestAlreadyDecidedError,
   RefundRequestNotFoundError,
+  TeamSeatClaimedError,
 } from "~/lib/refund-decisions.server";
+import { sendEmail } from "~/lib/email.server";
+import { RefundRequestStatusBadge } from "~/components/refund-request-status-badge";
 import { formatPrice } from "~/lib/utils";
 import { Card, CardContent } from "~/components/ui/card";
 import { Button } from "~/components/ui/button";
@@ -108,76 +111,65 @@ export async function action({ request }: Route.ActionArgs) {
   const parsed = parseFormData(formData, refundDecisionActionSchema);
 
   if (!parsed.success) {
-    return data(
-      { error: Object.values(parsed.errors)[0] ?? "Invalid input." },
-      { status: 400 }
-    );
+    throw data(Object.values(parsed.errors)[0] ?? "Invalid input.", {
+      status: 400,
+    });
   }
 
-  if (parsed.data.intent === "approve") {
-    try {
+  try {
+    if (parsed.data.intent === "approve") {
       const decision = approveRefundRequest(db, {
         refundRequestId: parsed.data.refundRequestId,
         staffUserId: currentUser.id,
       });
-
-      const email = buildApprovedRefundRequestEmail(decision);
-      console.log(
-        `[email] to=${email.to} subject=${email.subject}\n${email.body}`
-      );
+      sendEmail(buildApprovedRefundRequestEmail(decision));
 
       return {
-        success: true,
         message: `Approved the ${formatPrice(decision.amountRefunded)} refund to ${decision.learner.name}.`,
       };
-    } catch (e) {
-      if (e instanceof RefundRequestAlreadyDecidedError) {
-        return data({ error: e.message }, { status: 409 });
-      }
-      if (e instanceof RefundRequestNotFoundError) {
-        return data({ error: e.message }, { status: 404 });
-      }
-      throw e;
     }
-  }
 
-  if (parsed.data.intent === "decline") {
-    try {
-      const decision = declineRefundRequest(db, {
-        refundRequestId: parsed.data.refundRequestId,
-        staffUserId: currentUser.id,
-        declineNote: parsed.data.declineNote,
-      });
+    const decision = declineRefundRequest(db, {
+      refundRequestId: parsed.data.refundRequestId,
+      staffUserId: currentUser.id,
+      declineNote: parsed.data.declineNote,
+    });
+    sendEmail(buildDeclinedRefundRequestEmail(decision));
 
-      const email = buildDeclinedRefundRequestEmail(decision);
-      console.log(
-        `[email] to=${email.to} subject=${email.subject}\n${email.body}`
-      );
-
-      return { success: true, message: "Refund Request declined." };
-    } catch (e) {
-      if (e instanceof RefundRequestAlreadyDecidedError) {
-        return data({ error: e.message }, { status: 409 });
-      }
-      if (e instanceof DeclineNoteRequiredError) {
-        return data({ error: e.message }, { status: 400 });
-      }
-      throw e;
+    return { message: "Refund Request declined." };
+  } catch (e) {
+    if (e instanceof RefundRequestNotFoundError) {
+      throw data(e.message, { status: 404 });
     }
+    if (
+      e instanceof RefundRequestAlreadyDecidedError ||
+      e instanceof TeamSeatClaimedError
+    ) {
+      throw data(e.message, { status: 409 });
+    }
+    if (e instanceof DeclineNoteRequiredError) {
+      throw data(e.message, { status: 400 });
+    }
+    throw e;
   }
+}
 
-  throw data("Invalid action.", { status: 400 });
+/** Shows a toast with the decision once the fetcher's action succeeds. */
+function useDecisionToast(
+  fetcher: ReturnType<typeof useFetcher<typeof action>>
+) {
+  useEffect(() => {
+    if (fetcher.state === "idle" && fetcher.data) {
+      toast.success(fetcher.data.message);
+    }
+  }, [fetcher.state, fetcher.data]);
 }
 
 function DeclineRefundRequestForm({ requestId }: { requestId: number }) {
   const [declineNote, setDeclineNote] = useState("");
   const fetcher = useFetcher<typeof action>();
 
-  useEffect(() => {
-    if (fetcher.state !== "idle" || !fetcher.data) return;
-    if ("error" in fetcher.data) toast.error(fetcher.data.error);
-    else toast.success(fetcher.data.message);
-  }, [fetcher.state, fetcher.data]);
+  useDecisionToast(fetcher);
 
   const noteId = `decline-note-${requestId}`;
 
@@ -228,11 +220,7 @@ function ApproveRefundRequestButton({
 }) {
   const fetcher = useFetcher<typeof action>();
 
-  useEffect(() => {
-    if (fetcher.state !== "idle" || !fetcher.data) return;
-    if ("error" in fetcher.data) toast.error(fetcher.data.error);
-    else toast.success(fetcher.data.message);
-  }, [fetcher.state, fetcher.data]);
+  useDecisionToast(fetcher);
 
   function approve() {
     fetcher.submit(
@@ -330,8 +318,6 @@ function ClosedRefundRequestCard({
 }: {
   request: ClosedRefundRequest;
 }) {
-  const approved = request.status === RefundStatus.Approved;
-
   return (
     <Card>
       <CardContent className="space-y-4 p-5">
@@ -354,24 +340,16 @@ function ClosedRefundRequestCard({
           <div>
             <dt className="text-muted-foreground">Outcome</dt>
             <dd>
-              <span
-                className={
-                  approved
-                    ? "rounded-full bg-primary px-2 py-0.5 text-xs font-medium text-primary-foreground"
-                    : "rounded-full bg-muted px-2 py-0.5 text-xs font-medium"
-                }
-              >
-                {approved ? "Approved" : "Declined"}
-              </span>
+              <RefundRequestStatusBadge status={request.status} />
             </dd>
           </div>
           <div>
-            <dt className="text-muted-foreground">Decided by</dt>
-            <dd>{request.decidedBy?.name ?? "Unknown"}</dd>
+            <dt className="text-muted-foreground">Closed by</dt>
+            <dd>{request.closedBy?.name ?? "Unknown"}</dd>
           </div>
           <div>
-            <dt className="text-muted-foreground">Decided</dt>
-            <dd>{request.decidedAt ? formatDate(request.decidedAt) : "—"}</dd>
+            <dt className="text-muted-foreground">Closed</dt>
+            <dd>{request.closedAt ? formatDate(request.closedAt) : "—"}</dd>
           </div>
           <div>
             <dt className="text-muted-foreground">Requested</dt>
@@ -384,7 +362,7 @@ function ClosedRefundRequestCard({
           <p className="whitespace-pre-wrap">{request.reason}</p>
         </div>
 
-        {!approved && request.declineNote && (
+        {request.status === RefundStatus.Declined && request.declineNote && (
           <div className="text-sm">
             <p className="mb-1 text-muted-foreground">Decline Note</p>
             <p className="whitespace-pre-wrap">{request.declineNote}</p>
@@ -413,8 +391,8 @@ export default function StaffRefundRequests({
       <div className="mb-8">
         <h1 className="text-3xl font-bold">Refund Requests</h1>
         <p className="mt-1 text-muted-foreground">
-          Open Refund Requests oldest first, then Closed ones newest decision
-          first
+          Open Refund Requests oldest first, then Closed ones most recently
+          closed first
         </p>
       </div>
 
@@ -477,6 +455,9 @@ export function ErrorBoundary({ error }: Route.ErrorBoundaryProps) {
         typeof error.data === "string"
           ? error.data
           : "Only Staff can see Refund Requests.";
+    } else if (error.status === 409) {
+      title = "Refund Request not changed";
+      message = typeof error.data === "string" ? error.data : error.statusText;
     } else {
       title = `Error ${error.status}`;
       message = typeof error.data === "string" ? error.data : error.statusText;
@@ -490,8 +471,11 @@ export function ErrorBoundary({ error }: Route.ErrorBoundaryProps) {
         <h1 className="mb-2 text-2xl font-bold">{title}</h1>
         <p className="mb-6 text-muted-foreground">{message}</p>
         <div className="flex items-center justify-center gap-3">
+          <Link to="/admin/refunds">
+            <Button>Back to Refund Requests</Button>
+          </Link>
           <Link to="/">
-            <Button>Go Home</Button>
+            <Button variant="outline">Go Home</Button>
           </Link>
         </div>
       </div>

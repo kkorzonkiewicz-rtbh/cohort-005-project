@@ -1,4 +1,4 @@
-import { and, asc, desc, eq, isNull, ne, sql } from "drizzle-orm";
+import { and, asc, desc, eq, ne, sql } from "drizzle-orm";
 import { alias } from "drizzle-orm/sqlite-core";
 import type { Db } from "~/db";
 import {
@@ -15,7 +15,32 @@ import {
   RefundStatus,
 } from "~/db/schema";
 import { getHoursWatched } from "~/lib/hours-watched.server";
+import {
+  hasClaimedTeamSeat,
+  isUnclaimedTeamSeat,
+} from "~/lib/team-seats.server";
 import { formatPrice } from "~/lib/utils";
+
+/**
+ * The Refund Request with what deciding it needs: the purchase, the learner
+ * who raised it and the course bought. Takes the database or a transaction.
+ */
+function findRefundRequest(db: Pick<Db, "select">, refundRequestId: number) {
+  return db
+    .select({
+      purchaseId: purchases.id,
+      amountPaid: purchases.amountPaid,
+      courseId: purchases.courseId,
+      courseTitle: courses.title,
+      learner: { id: users.id, name: users.name, email: users.email },
+    })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .innerJoin(users, eq(purchases.userId, users.id))
+    .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .where(eq(refunds.id, refundRequestId))
+    .get();
+}
 
 function countLessons(db: Db, courseId: number) {
   const result = db
@@ -76,9 +101,9 @@ export function listRefundRequestsForStaff(db: Db) {
   return { open, closed: listClosedRefundRequests(db) };
 }
 
-/** Closed Refund Requests, newest decision first. */
+/** Closed Refund Requests, most recently closed first. */
 function listClosedRefundRequests(db: Db) {
-  const decider = alias(users, "decider");
+  const closer = alias(users, "closer");
 
   return db
     .select({
@@ -89,15 +114,15 @@ function listClosedRefundRequests(db: Db) {
       requestedAt: refunds.requestedAt,
       reason: refunds.reason,
       status: refunds.status,
-      decidedAt: refunds.resolvedAt,
-      decidedBy: { id: decider.id, name: decider.name },
+      closedAt: refunds.resolvedAt,
+      closedBy: { id: closer.id, name: closer.name },
       declineNote: refunds.declineNote,
     })
     .from(refunds)
     .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
     .innerJoin(users, eq(purchases.userId, users.id))
     .innerJoin(courses, eq(purchases.courseId, courses.id))
-    .leftJoin(decider, eq(refunds.resolvedByUserId, decider.id))
+    .leftJoin(closer, eq(refunds.resolvedByUserId, closer.id))
     .where(ne(refunds.status, RefundStatus.Open))
     .orderBy(desc(refunds.resolvedAt), desc(refunds.id))
     .all();
@@ -113,15 +138,16 @@ export function listRefundRequestsForLearner(db: Db, userId: number) {
       reason: refunds.reason,
       status: refunds.status,
       requestedAt: refunds.requestedAt,
-      resolvedAt: refunds.resolvedAt,
+      closedAt: refunds.resolvedAt,
       declineNote: refunds.declineNote,
     })
     .from(refunds)
     .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .innerJoin(users, eq(purchases.userId, users.id))
     .innerJoin(courses, eq(purchases.courseId, courses.id))
     .where(eq(purchases.userId, userId))
     .orderBy(
-      // Open Refund Requests first, then Closed ones newest decision first.
+      // Open Refund Requests first, then Closed ones most recently closed first.
       sql`case when ${refunds.status} = ${RefundStatus.Open} then 0 else 1 end`,
       desc(refunds.resolvedAt),
       desc(refunds.requestedAt)
@@ -143,6 +169,15 @@ export class RefundRequestNotFoundError extends Error {
   }
 }
 
+export class TeamSeatClaimedError extends Error {
+  constructor() {
+    super(
+      "Someone has claimed a Team Seat from this purchase, so it can't be refunded"
+    );
+    this.name = "TeamSeatClaimedError";
+  }
+}
+
 export class DeclineNoteRequiredError extends Error {
   constructor() {
     super("A Decline Note is required to decline a Refund Request");
@@ -151,14 +186,38 @@ export class DeclineNoteRequiredError extends Error {
 }
 
 /**
+ * Closes an Open Refund Request with the given outcome. The update only
+ * matches an Open request, so when two Staff decide at once the first
+ * decision wins and the second is refused.
+ */
+function closeRefundRequest(
+  db: Pick<Db, "update">,
+  refundRequestId: number,
+  outcome: Pick<
+    typeof refunds.$inferInsert,
+    "status" | "amountRefunded" | "declineNote" | "resolvedByUserId"
+  >
+) {
+  const { changes } = db
+    .update(refunds)
+    .set({ ...outcome, resolvedAt: new Date().toISOString() })
+    .where(
+      and(
+        eq(refunds.id, refundRequestId),
+        eq(refunds.status, RefundStatus.Open)
+      )
+    )
+    .run();
+  if (changes === 0) throw new RefundRequestAlreadyDecidedError();
+}
+
+/**
  * Approves an Open Refund Request. The full amount paid becomes the Refund
  * (an approved request with `amountRefunded` set is the Pending Refund), and
  * the learner loses access by losing every enrollment row for the course.
  * Progress, watch events, quiz attempts and ratings are kept (ADR 0001).
- * On a Team purchase, every unclaimed Team Seat is voided (ADR 0002).
- *
- * The update only matches an Open request, so when two Staff decide at once
- * the first decision wins and the second is refused.
+ * On a Team purchase, every unclaimed Team Seat is voided (ADR 0002); a
+ * purchase with any claimed Team Seat can't be refunded.
  *
  * Returns what the learner's approved email needs.
  */
@@ -167,41 +226,20 @@ export function approveRefundRequest(
   input: { refundRequestId: number; staffUserId: number }
 ) {
   return db.transaction((tx) => {
-    const request = tx
-      .select({
-        purchaseId: purchases.id,
-        amountPaid: purchases.amountPaid,
-        courseId: purchases.courseId,
-        courseTitle: courses.title,
-        learner: { id: users.id, name: users.name, email: users.email },
-      })
-      .from(refunds)
-      .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
-      .innerJoin(users, eq(purchases.userId, users.id))
-      .innerJoin(courses, eq(purchases.courseId, courses.id))
-      .where(eq(refunds.id, input.refundRequestId))
-      .get();
-
+    const request = findRefundRequest(tx, input.refundRequestId);
     if (!request) throw new RefundRequestNotFoundError();
 
-    const approved = tx
-      .update(refunds)
-      .set({
-        status: RefundStatus.Approved,
-        amountRefunded: request.amountPaid,
-        resolvedAt: new Date().toISOString(),
-        resolvedByUserId: input.staffUserId,
-      })
-      .where(
-        and(
-          eq(refunds.id, input.refundRequestId),
-          eq(refunds.status, RefundStatus.Open)
-        )
-      )
-      .returning({ amountRefunded: refunds.amountRefunded })
-      .get();
+    closeRefundRequest(tx, input.refundRequestId, {
+      status: RefundStatus.Approved,
+      amountRefunded: request.amountPaid,
+      resolvedByUserId: input.staffUserId,
+    });
 
-    if (!approved) throw new RefundRequestAlreadyDecidedError();
+    // A Team Seat may have been claimed since the request was raised. Throwing
+    // rolls the approval back.
+    if (hasClaimedTeamSeat(tx, request.purchaseId)) {
+      throw new TeamSeatClaimedError();
+    }
 
     // Nothing enforces one enrollment per learner and course, so remove them all.
     tx.delete(enrollments)
@@ -213,16 +251,10 @@ export function approveRefundRequest(
       )
       .run();
 
-    // A Team purchase is only refundable while no seat is claimed, but void
-    // just the unclaimed ones so a claimed seat is never taken away.
     tx.update(coupons)
       .set({ voidedAt: new Date().toISOString() })
       .where(
-        and(
-          eq(coupons.purchaseId, request.purchaseId),
-          isNull(coupons.redeemedByUserId),
-          isNull(coupons.voidedAt)
-        )
+        and(eq(coupons.purchaseId, request.purchaseId), isUnclaimedTeamSeat())
       )
       .run();
 
@@ -232,26 +264,6 @@ export function approveRefundRequest(
       amountRefunded: request.amountPaid,
     };
   });
-}
-
-/**
- * Whether a Team Seat code can still be redeemed: it exists, nobody has
- * claimed it, and it was not voided by an approved Refund (ADR 0002).
- */
-export function isTeamSeatRedeemable(db: Db, code: string) {
-  const seat = db
-    .select({ id: coupons.id })
-    .from(coupons)
-    .where(
-      and(
-        eq(coupons.code, code),
-        isNull(coupons.redeemedByUserId),
-        isNull(coupons.voidedAt)
-      )
-    )
-    .get();
-
-  return seat !== undefined;
 }
 
 export function declineRefundRequest(
@@ -266,39 +278,20 @@ export function declineRefundRequest(
   if (note === "") throw new DeclineNoteRequiredError();
 
   return db.transaction((tx) => {
-    // Conditional on the request still being Open, so a concurrent second
-    // decision changes no rows and is refused: the first decision wins.
-    const { changes } = tx
-      .update(refunds)
-      .set({
-        status: RefundStatus.Declined,
-        declineNote: note,
-        resolvedAt: new Date().toISOString(),
-        resolvedByUserId: staffUserId,
-      })
-      .where(
-        and(
-          eq(refunds.id, refundRequestId),
-          eq(refunds.status, RefundStatus.Open)
-        )
-      )
-      .run();
-    if (changes === 0) throw new RefundRequestAlreadyDecidedError();
+    const request = findRefundRequest(tx, refundRequestId);
+    if (!request) throw new RefundRequestNotFoundError();
 
-    const declined = tx
-      .select({
-        learner: { name: users.name, email: users.email },
-        courseTitle: courses.title,
-      })
-      .from(refunds)
-      .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
-      .innerJoin(users, eq(purchases.userId, users.id))
-      .innerJoin(courses, eq(purchases.courseId, courses.id))
-      .where(eq(refunds.id, refundRequestId))
-      .get();
-    if (!declined) throw new RefundRequestAlreadyDecidedError();
+    closeRefundRequest(tx, refundRequestId, {
+      status: RefundStatus.Declined,
+      declineNote: note,
+      resolvedByUserId: staffUserId,
+    });
 
-    return { ...declined, declineNote: note };
+    return {
+      learner: request.learner,
+      courseTitle: request.courseTitle,
+      declineNote: note,
+    };
   });
 }
 

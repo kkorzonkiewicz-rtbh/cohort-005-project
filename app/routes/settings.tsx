@@ -17,6 +17,7 @@ import { db } from "~/db";
 import { eq } from "drizzle-orm";
 import { formatPrice } from "~/lib/utils";
 import { listRefundRequestsForLearner } from "~/lib/refund-decisions.server";
+import { RefundRequestStatusBadge } from "~/components/refund-request-status-badge";
 
 const settingsSchema = z.object({
   name: z.string().trim().min(1, "Name cannot be empty."),
@@ -88,7 +89,8 @@ export async function action({ request }: Route.ActionArgs) {
 
   const { name, bio } = parsed.data;
 
-  db.update(users)
+  db
+    .update(users)
     .set({ name, email: currentUser.email, bio: bio || null })
     .where(eq(users.id, currentUser.id))
     .returning()
@@ -109,8 +111,7 @@ export default function Settings({ loaderData }: Route.ComponentProps) {
       toast.success("Profile updated successfully.");
     }
     if (fetcher.state === "idle" && fetcher.data?.errors) {
-      const firstError = Object.values(fetcher.data.errors)[0] as
-        string | undefined;
+      const firstError = Object.values(fetcher.data.errors)[0] as string | undefined;
       if (firstError) toast.error(firstError);
     }
   }, [fetcher.state, fetcher.data]);
@@ -178,7 +179,10 @@ export default function Settings({ loaderData }: Route.ComponentProps) {
                 </p>
               </div>
             )}
-            <Button type="submit" disabled={fetcher.state !== "idle"}>
+            <Button
+              type="submit"
+              disabled={fetcher.state !== "idle"}
+            >
               {fetcher.state !== "idle" ? "Saving..." : "Save Changes"}
             </Button>
           </fetcher.Form>
@@ -191,7 +195,7 @@ export default function Settings({ loaderData }: Route.ComponentProps) {
             <h2 className="text-lg font-semibold">Refund Requests</h2>
             <p className="text-sm text-muted-foreground">
               {openCount === 0
-                ? "We have decided all of your refund requests."
+                ? "None of your refund requests are waiting on us."
                 : openCount === 1
                   ? "One refund request is waiting on us."
                   : `${openCount} refund requests are waiting on us.`}
@@ -207,12 +211,12 @@ export default function Settings({ loaderData }: Route.ComponentProps) {
                   >
                     {refundRequest.courseTitle}
                   </Link>
-                  <OutcomeBadge status={refundRequest.status} />
+                  <RefundRequestStatusBadge status={refundRequest.status} />
                 </div>
                 <p className="mt-1 text-sm text-muted-foreground">
                   {formatPrice(refundRequest.amountPaid)} ·{" "}
-                  {refundRequest.resolvedAt
-                    ? `decided ${new Date(refundRequest.resolvedAt).toLocaleDateString()}`
+                  {refundRequest.closedAt
+                    ? `closed ${new Date(refundRequest.closedAt).toLocaleDateString()}`
                     : `raised ${new Date(refundRequest.requestedAt).toLocaleDateString()}`}
                 </p>
                 <p className="mt-2 text-sm">{refundRequest.reason}</p>
@@ -234,34 +238,6 @@ export default function Settings({ loaderData }: Route.ComponentProps) {
   );
 }
 
-const outcomeBadges = {
-  [RefundStatus.Open]: {
-    label: "Open",
-    className:
-      "bg-amber-100 text-amber-800 dark:bg-amber-900/30 dark:text-amber-300",
-  },
-  [RefundStatus.Approved]: {
-    label: "Approved",
-    className:
-      "bg-green-100 text-green-800 dark:bg-green-900/30 dark:text-green-300",
-  },
-  [RefundStatus.Declined]: {
-    label: "Declined",
-    className: "bg-red-100 text-red-800 dark:bg-red-900/30 dark:text-red-300",
-  },
-} satisfies Record<RefundStatus, { label: string; className: string }>;
-
-function OutcomeBadge({ status }: { status: RefundStatus }) {
-  const badge = outcomeBadges[status];
-  return (
-    <span
-      className={`shrink-0 rounded-full px-2.5 py-0.5 text-xs font-medium ${badge.className}`}
-    >
-      {badge.label}
-    </span>
-  );
-}
-
 export function ErrorBoundary({ error }: Route.ErrorBoundaryProps) {
   let title = "Something went wrong";
   let message = "An unexpected error occurred.";
@@ -275,10 +251,12 @@ export function ErrorBoundary({ error }: Route.ErrorBoundaryProps) {
           : "Please select a user from the DevUI panel.";
     } else if (error.status === 404) {
       title = "User not found";
-      message = typeof error.data === "string" ? error.data : "User not found.";
+      message =
+        typeof error.data === "string" ? error.data : "User not found.";
     } else {
       title = `Error ${error.status}`;
-      message = typeof error.data === "string" ? error.data : error.statusText;
+      message =
+        typeof error.data === "string" ? error.data : error.statusText;
     }
   }
 
