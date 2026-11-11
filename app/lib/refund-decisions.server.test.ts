@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from "vitest";
+import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { createTestDb, seedBaseData } from "~/test/setup";
 import * as schema from "~/db/schema";
 import { eq } from "drizzle-orm";
@@ -247,6 +247,128 @@ describe("listRefundRequestsForStaff", () => {
     const result = listRefundRequestsForStaff(testDb);
 
     expect(result.open.map((request) => request.id)).toEqual([open.id]);
+  });
+
+  describe("Closed Refund Requests", () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    function addStaff() {
+      return testDb
+        .insert(schema.users)
+        .values({
+          name: "Staff Member",
+          email: "staff@example.com",
+          role: schema.UserRole.Admin,
+        })
+        .returning()
+        .get();
+    }
+
+    function decideAt(iso: string) {
+      vi.useFakeTimers({ toFake: ["Date"] });
+      vi.setSystemTime(new Date(iso));
+    }
+
+    it("lists a Declined Refund Request with the outcome, decider, time and Decline Note", () => {
+      const staff = addStaff();
+      const purchase = buy(
+        base.user.id,
+        base.course.id,
+        "2026-11-01T10:00:00.000Z"
+      );
+      const request = raiseRefundRequest(
+        purchase.id,
+        "2026-11-03T09:00:00.000Z"
+      );
+      decideAt("2026-11-04T12:00:00.000Z");
+      declineRefundRequest(testDb, {
+        refundRequestId: request.id,
+        staffUserId: staff.id,
+        declineNote: "You've watched most of the course.",
+      });
+
+      const { open, closed } = listRefundRequestsForStaff(testDb);
+
+      expect(open).toEqual([]);
+      expect(closed).toEqual([
+        {
+          id: request.id,
+          learner: {
+            id: base.user.id,
+            name: "Test User",
+            email: "test@example.com",
+          },
+          courseTitle: "Test Course",
+          amountPaid: 7900,
+          requestedAt: "2026-11-03T09:00:00.000Z",
+          reason: "Bought the wrong one.",
+          status: schema.RefundStatus.Declined,
+          decidedAt: "2026-11-04T12:00:00.000Z",
+          decidedBy: { id: staff.id, name: "Staff Member" },
+          declineNote: "You've watched most of the course.",
+        },
+      ]);
+    });
+
+    it("lists the newest decision first and leaves out Open Refund Requests", () => {
+      const staff = addStaff();
+      const learnersPurchase = buy(
+        base.user.id,
+        base.course.id,
+        "2026-10-01T10:00:00.000Z"
+      );
+      const instructorsPurchase = buy(
+        base.instructor.id,
+        base.course.id,
+        "2026-10-02T10:00:00.000Z"
+      );
+      // Raised first but decided last.
+      const decidedLast = raiseRefundRequest(
+        learnersPurchase.id,
+        "2026-10-05T09:00:00.000Z"
+      );
+      const decidedFirst = raiseRefundRequest(
+        instructorsPurchase.id,
+        "2026-10-06T09:00:00.000Z"
+      );
+
+      decideAt("2026-10-07T12:00:00.000Z");
+      approveRefundRequest(testDb, {
+        refundRequestId: decidedFirst.id,
+        staffUserId: staff.id,
+      });
+      decideAt("2026-10-09T12:00:00.000Z");
+      declineRefundRequest(testDb, {
+        refundRequestId: decidedLast.id,
+        staffUserId: staff.id,
+        declineNote: "Most of the course is watched.",
+      });
+      const stillOpen = raiseRefundRequest(
+        learnersPurchase.id,
+        "2026-10-10T09:00:00.000Z"
+      );
+
+      const { open, closed } = listRefundRequestsForStaff(testDb);
+
+      expect(open.map((request) => request.id)).toEqual([stillOpen.id]);
+      expect(closed).toEqual([
+        expect.objectContaining({
+          id: decidedLast.id,
+          status: schema.RefundStatus.Declined,
+          decidedAt: "2026-10-09T12:00:00.000Z",
+        }),
+        expect.objectContaining({
+          id: decidedFirst.id,
+          learner: expect.objectContaining({ name: "Test Instructor" }),
+          status: schema.RefundStatus.Approved,
+          decidedAt: "2026-10-07T12:00:00.000Z",
+          decidedBy: { id: staff.id, name: "Staff Member" },
+          declineNote: null,
+        }),
+      ]);
+    });
   });
 });
 

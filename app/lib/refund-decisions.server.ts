@@ -1,4 +1,5 @@
-import { and, asc, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, isNull, ne, sql } from "drizzle-orm";
+import { alias } from "drizzle-orm/sqlite-core";
 import type { Db } from "~/db";
 import {
   coupons,
@@ -72,7 +73,34 @@ export function listRefundRequestsForStaff(db: Db) {
     totalLessons: countLessons(db, courseId),
   }));
 
-  return { open };
+  return { open, closed: listClosedRefundRequests(db) };
+}
+
+/** Closed Refund Requests, newest decision first. */
+function listClosedRefundRequests(db: Db) {
+  const decider = alias(users, "decider");
+
+  return db
+    .select({
+      id: refunds.id,
+      learner: { id: users.id, name: users.name, email: users.email },
+      courseTitle: courses.title,
+      amountPaid: purchases.amountPaid,
+      requestedAt: refunds.requestedAt,
+      reason: refunds.reason,
+      status: refunds.status,
+      decidedAt: refunds.resolvedAt,
+      decidedBy: { id: decider.id, name: decider.name },
+      declineNote: refunds.declineNote,
+    })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .innerJoin(users, eq(purchases.userId, users.id))
+    .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .leftJoin(decider, eq(refunds.resolvedByUserId, decider.id))
+    .where(ne(refunds.status, RefundStatus.Open))
+    .orderBy(desc(refunds.resolvedAt), desc(refunds.id))
+    .all();
 }
 
 export function listRefundRequestsForLearner(db: Db, userId: number) {
