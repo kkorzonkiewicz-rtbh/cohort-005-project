@@ -5,6 +5,7 @@ import { eq } from "drizzle-orm";
 import {
   buildDeclinedRefundRequestEmail,
   declineRefundRequest,
+  listRefundRequestsForLearner,
   listRefundRequestsForStaff,
   RefundRequestAlreadyDecidedError,
 } from "./refund-decisions.server";
@@ -408,5 +409,113 @@ describe("declineRefundRequest", () => {
     expect(email.subject).toContain("Test Course");
     expect(email.body).toContain("Hi Test User,");
     expect(email.body).toContain("You've watched most of the course.");
+  });
+});
+
+describe("listRefundRequestsForLearner", () => {
+  function closedRefundRequest(
+    purchaseId: number,
+    {
+      status,
+      requestedAt,
+      resolvedAt,
+      declineNote = null,
+    }: {
+      status: schema.RefundStatus;
+      requestedAt: string;
+      resolvedAt: string;
+      declineNote?: string | null;
+    }
+  ) {
+    return testDb
+      .insert(schema.refunds)
+      .values({
+        purchaseId,
+        status,
+        reason: "Bought the wrong one.",
+        requestedAt,
+        resolvedAt,
+        declineNote,
+      })
+      .returning()
+      .get();
+  }
+
+  it("lists only the learner's own Refund Requests, with the course and amount", () => {
+    const own = buy(base.user.id, base.course.id, "2026-11-01T10:00:00.000Z");
+    const someoneElses = buy(
+      base.instructor.id,
+      base.course.id,
+      "2026-11-01T10:00:00.000Z"
+    );
+    const request = raiseRefundRequest(own.id, "2026-11-03T09:00:00.000Z");
+    raiseRefundRequest(someoneElses.id, "2026-11-04T09:00:00.000Z");
+
+    const requests = listRefundRequestsForLearner(testDb, base.user.id);
+
+    expect(requests).toEqual([
+      {
+        id: request.id,
+        courseTitle: "Test Course",
+        courseSlug: "test-course",
+        amountPaid: 7900,
+        reason: "Bought the wrong one.",
+        status: schema.RefundStatus.Open,
+        requestedAt: "2026-11-03T09:00:00.000Z",
+        resolvedAt: null,
+        declineNote: null,
+      },
+    ]);
+  });
+
+  it("lists Open Refund Requests first, then Closed ones newest decision first", () => {
+    const purchase = buy(
+      base.user.id,
+      base.course.id,
+      "2026-09-01T10:00:00.000Z"
+    );
+    const olderDecision = closedRefundRequest(purchase.id, {
+      status: schema.RefundStatus.Declined,
+      requestedAt: "2026-09-02T09:00:00.000Z",
+      resolvedAt: "2026-09-05T09:00:00.000Z",
+      declineNote: "Most of the course is watched.",
+    });
+    const newerDecision = closedRefundRequest(purchase.id, {
+      status: schema.RefundStatus.Approved,
+      requestedAt: "2026-10-01T09:00:00.000Z",
+      resolvedAt: "2026-10-03T09:00:00.000Z",
+    });
+    const open = raiseRefundRequest(purchase.id, "2026-08-01T09:00:00.000Z");
+
+    const requests = listRefundRequestsForLearner(testDb, base.user.id);
+
+    expect(requests.map((request) => request.id)).toEqual([
+      open.id,
+      newerDecision.id,
+      olderDecision.id,
+    ]);
+  });
+
+  it("shows a Declined Refund Request with its Decline Note and decision date", () => {
+    const purchase = buy(
+      base.user.id,
+      base.course.id,
+      "2026-11-01T10:00:00.000Z"
+    );
+    const request = raiseRefundRequest(purchase.id, "2026-11-03T09:00:00.000Z");
+    declineRefundRequest(testDb, {
+      refundRequestId: request.id,
+      staffUserId: base.instructor.id,
+      declineNote: "You've watched most of the course.",
+    });
+
+    const [declined] = listRefundRequestsForLearner(testDb, base.user.id);
+
+    expect(declined).toMatchObject({
+      id: request.id,
+      status: schema.RefundStatus.Declined,
+      declineNote: "You've watched most of the course.",
+      resolvedAt: expect.any(String),
+    });
   });
 });

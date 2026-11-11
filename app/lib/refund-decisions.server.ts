@@ -1,4 +1,4 @@
-import { and, asc, eq, sql } from "drizzle-orm";
+import { and, asc, desc, eq, sql } from "drizzle-orm";
 import type { Db } from "~/db";
 import {
   courses,
@@ -70,6 +70,32 @@ export function listRefundRequestsForStaff(db: Db) {
   }));
 
   return { open };
+}
+
+export function listRefundRequestsForLearner(db: Db, userId: number) {
+  return db
+    .select({
+      id: refunds.id,
+      courseTitle: courses.title,
+      courseSlug: courses.slug,
+      amountPaid: purchases.amountPaid,
+      reason: refunds.reason,
+      status: refunds.status,
+      requestedAt: refunds.requestedAt,
+      resolvedAt: refunds.resolvedAt,
+      declineNote: refunds.declineNote,
+    })
+    .from(refunds)
+    .innerJoin(purchases, eq(refunds.purchaseId, purchases.id))
+    .innerJoin(courses, eq(purchases.courseId, courses.id))
+    .where(eq(purchases.userId, userId))
+    .orderBy(
+      // Open Refund Requests first, then Closed ones newest decision first.
+      sql`case when ${refunds.status} = ${RefundStatus.Open} then 0 else 1 end`,
+      desc(refunds.resolvedAt),
+      desc(refunds.requestedAt)
+    )
+    .all();
 }
 
 export class RefundRequestAlreadyDecidedError extends Error {
