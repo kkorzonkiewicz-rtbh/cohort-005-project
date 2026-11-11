@@ -2267,7 +2267,8 @@ This course is still in draft while the cluster examples are rewritten against t
     })
     .run();
 
-  db.insert(schema.purchases)
+  const [sophiaPurchase] = db
+    .insert(schema.purchases)
     .values({
       userId: students[4].id, // Sophia — bought course 1 individually
       courseId: course1.id,
@@ -2275,7 +2276,8 @@ This course is still in draft while the cluster examples are rewritten against t
       country: "US",
       createdAt: daysAgo(15),
     })
-    .run();
+    .returning()
+    .all();
 
   console.log(`Created ${countRows(schema.purchases)} individual purchases.`);
 
@@ -2782,6 +2784,22 @@ This course is still in draft while the cluster examples are rewritten against t
     .run();
 
   console.log("Created Liam's Refund Request.");
+
+  // ─── Sophia's Refund Request ───
+  // A second Open Refund Request, raised before Liam's, so the Staff queue
+  // has something to put first.
+
+  db.insert(schema.refunds)
+    .values({
+      purchaseId: sophiaPurchase.id,
+      status: RefundStatus.Open,
+      reason:
+        "The pace is too fast for me. I thought this was a beginner course and I keep getting lost after the first module.",
+      requestedAt: daysAgo(12),
+    })
+    .run();
+
+  console.log("Created Sophia's Refund Request.");
 
   // ─── Flush watch events ───
   // Batched: the heartbeat makes these by far the largest table, and one
