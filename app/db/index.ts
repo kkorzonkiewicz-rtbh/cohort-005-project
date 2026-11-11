@@ -39,7 +39,9 @@ function openDatabase(filename: string) {
   }
 }
 
-let instance: ReturnType<typeof drizzle<typeof schema>> | undefined;
+export type Db = ReturnType<typeof drizzle<typeof schema>>;
+
+let instance: Db | undefined;
 
 function getDb() {
   if (!instance) {

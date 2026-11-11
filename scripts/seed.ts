@@ -1785,7 +1785,9 @@ This course is still in draft while the cluster examples are rewritten against t
   // Varied enrollment patterns:
   // - Emma: enrolled in both courses (nearly complete in course 1, mid-way in course 2)
   // - James: enrolled in course 1 only (completed)
-  // - Olivia: enrolled in both courses (just started course 1, mid-way in course 2)
+  // - Olivia: enrolled in course 2 only (mid-way). She started course 1 too,
+  //   but her Refund Request for it was approved, so that enrollment is gone
+  //   and her course 1 progress is kept (see "Olivia's Refund Request").
   // - Liam: enrolled in course 2 only (just started, abandoned)
   // - Sophia: enrolled in course 1 only (recently enrolled, barely started)
 
@@ -1799,7 +1801,6 @@ This course is still in draft while the cluster examples are rewritten against t
         enrolledAt: daysAgo(45),
         completedAt: daysAgo(10),
       },
-      { userId: students[2].id, courseId: course1.id, enrolledAt: daysAgo(35) },
       { userId: students[2].id, courseId: course2.id, enrolledAt: daysAgo(30) },
       { userId: students[3].id, courseId: course2.id, enrolledAt: daysAgo(25) },
       { userId: students[4].id, courseId: course1.id, enrolledAt: daysAgo(15) },
@@ -2257,7 +2258,8 @@ This course is still in draft while the cluster examples are rewritten against t
     })
     .run();
 
-  db.insert(schema.purchases)
+  const [oliviaPurchase] = db
+    .insert(schema.purchases)
     .values({
       userId: students[2].id, // Olivia — bought course 1 individually
       courseId: course1.id,
@@ -2265,9 +2267,11 @@ This course is still in draft while the cluster examples are rewritten against t
       country: "US",
       createdAt: daysAgo(35),
     })
-    .run();
+    .returning()
+    .all();
 
-  db.insert(schema.purchases)
+  const [sophiaPurchase] = db
+    .insert(schema.purchases)
     .values({
       userId: students[4].id, // Sophia — bought course 1 individually
       courseId: course1.id,
@@ -2275,7 +2279,8 @@ This course is still in draft while the cluster examples are rewritten against t
       country: "US",
       createdAt: daysAgo(15),
     })
-    .run();
+    .returning()
+    .all();
 
   console.log(`Created ${countRows(schema.purchases)} individual purchases.`);
 
@@ -2782,6 +2787,62 @@ This course is still in draft while the cluster examples are rewritten against t
     .run();
 
   console.log("Created Liam's Refund Request.");
+
+  // ─── Sophia's Refund Request ───
+  // A second Open Refund Request, raised before Liam's, so the Staff queue
+  // has something to put first.
+
+  db.insert(schema.refunds)
+    .values({
+      purchaseId: sophiaPurchase.id,
+      status: RefundStatus.Open,
+      reason:
+        "The pace is too fast for me. I thought this was a beginner course and I keep getting lost after the first module.",
+      requestedAt: daysAgo(12),
+    })
+    .run();
+
+  console.log("Created Sophia's Refund Request.");
+
+  // ─── Olivia's Refund Request ───
+  // An Approved Refund Request. Approval records the full amount paid as the
+  // Refund (still Pending — no payments system yet) and removes her course 1
+  // enrollment, which is why the enrollments above leave it out. Her course 1
+  // progress, watch history and quiz attempts stay (ADR 0001).
+
+  db.insert(schema.refunds)
+    .values({
+      purchaseId: oliviaPurchase.id,
+      status: RefundStatus.Approved,
+      reason:
+        "My employer ended up buying the course for the whole team, so I don't need my own copy.",
+      amountRefunded: oliviaPurchase.amountPaid,
+      requestedAt: daysAgo(27),
+      resolvedAt: daysAgo(26),
+      resolvedByUserId: admin.id,
+    })
+    .run();
+
+  console.log("Created Olivia's Refund Request.");
+
+  // ─── Emma's Declined Refund Request ───
+  // A Closed Refund Request Staff turned down with a Decline Note. Declining
+  // leaves her enrollment and progress in course 1 as they were.
+
+  db.insert(schema.refunds)
+    .values({
+      purchaseId: purchase1.id, // Emma — course 1
+      status: RefundStatus.Declined,
+      reason: "I didn't enjoy the instructor's teaching style.",
+      requestedAt: daysAgo(48),
+      resolvedAt: daysAgo(47),
+      resolvedByUserId: admin.id,
+      declineNote:
+        "You've completed almost every lesson, so this is outside our refund policy. Reply to this email if something about the course didn't work for you.",
+    })
+    .run();
+
+  console.log("Created Emma's Declined Refund Request.");
 
   // ─── Flush watch events ───
   // Batched: the heartbeat makes these by far the largest table, and one
